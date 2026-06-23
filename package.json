@@ -1,0 +1,11 @@
+{
+  "name": "snakes-and-ladders",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "python3 -m http.server 5173",
+    "test": "node --test tests/game.test.mjs",
+    "check": "npm test && node --check src/game.js && node --check src/main.js"
+  }
+}

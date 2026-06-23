@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Snakes & Ladders</title>
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Classic race to 100</p>
+          <h1>Snakes & Ladders</h1>
+        </div>
+        <div class="turn-pill" aria-live="polite">
+          <span id="turnLabel">Coral's turn</span>
+        </div>
+      </header>
+
+      <section class="game-layout" aria-label="Snakes and ladders game">
+        <div class="board-wrap">
+          <div class="board-shell">
+            <div id="board" class="board" aria-label="Game board"></div>
+            <svg id="pathLayer" class="path-layer" aria-hidden="true"></svg>
+          </div>
+        </div>
+
+        <aside class="control-panel" aria-label="Game controls">
+          <div class="dice-row">
+            <div>
+              <p class="panel-label">Current roll</p>
+              <div id="diceFace" class="dice-face" aria-live="polite">-</div>
+            </div>
+            <div>
+              <p class="panel-label">Turn</p>
+              <div id="turnCount" class="turn-count">1</div>
+            </div>
+          </div>
+
+          <div class="button-row">
+            <button id="rollButton" class="primary-button" type="button" aria-label="Roll die">
+              <span aria-hidden="true">⚂</span>
+              <span>Roll</span>
+            </button>
+            <button id="resetButton" class="secondary-button" type="button" aria-label="Reset game">
+              <span aria-hidden="true">↻</span>
+              <span>Reset</span>
+            </button>
+          </div>
+
+          <div id="players" class="players" aria-label="Players"></div>
+
+          <div class="activity">
+            <p class="panel-label">Activity</p>
+            <ol id="eventLog" class="event-log" aria-live="polite"></ol>
+          </div>
+        </aside>
+      </section>
+    </main>
+
+    <script type="module" src="./src/main.js"></script>
+  </body>
+</html>
