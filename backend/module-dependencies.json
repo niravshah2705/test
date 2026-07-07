@@ -1,0 +1,11 @@
+{
+  "identity": ["audit-events"],
+  "traveler-profiles": ["identity", "audit-events"],
+  "flight-search": ["provider-adapters", "audit-events"],
+  "flight-booking": ["identity", "traveler-profiles", "flight-search", "payments", "provider-adapters", "notifications", "audit-events"],
+  "taxi-booking": ["identity", "traveler-profiles", "payments", "provider-adapters", "notifications", "audit-events"],
+  "payments": ["identity", "provider-adapters", "audit-events"],
+  "notifications": ["provider-adapters", "audit-events"],
+  "audit-events": [],
+  "provider-adapters": []
+}
