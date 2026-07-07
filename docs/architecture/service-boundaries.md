@@ -6,7 +6,7 @@ This architecture document defines the bounded contexts for the core travel plat
 
 - Status: reviewed for initial service/module decomposition.
 - Scope: flight catalog, availability, pricing, booking, payment, ticketing, user profile, and notification responsibilities.
-- Related cross-cutting contracts: [Domain event model](domain-events.md) and [Cross-cutting idempotency model](idempotency.md).
+- Related cross-cutting contracts: [Domain event model](domain-events.md), [Cross-cutting idempotency model](idempotency.md), and [Canonical booking lifecycle state model](booking-lifecycle-states.md).
 
 ## Boundary principles
 
