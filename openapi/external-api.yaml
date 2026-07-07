@@ -1,0 +1,494 @@
+openapi: 3.1.0
+info:
+  title: External Transactional API
+  version: 0.1.0
+  description: Initial skeleton for client-facing transactional API contracts.
+servers:
+  - url: https://api.example.com/v1
+    description: Production v1 API
+security:
+  - bearerAuth: []
+tags:
+  - name: Transactions
+    description: Transactional resource operations
+paths:
+  /transactions:
+    get:
+      tags:
+        - Transactions
+      summary: List transactions
+      description: Lists transactional resources using cursor pagination, filtering, sorting, and request correlation.
+      operationId: listTransactions
+      security:
+        - bearerAuth:
+            - transactions:read
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/PageSize'
+        - $ref: '#/components/parameters/PageAfter'
+        - $ref: '#/components/parameters/PageBefore'
+        - $ref: '#/components/parameters/FilterStatus'
+        - $ref: '#/components/parameters/FilterCreatedAtGte'
+        - $ref: '#/components/parameters/FilterCreatedAtLt'
+        - $ref: '#/components/parameters/Sort'
+      responses:
+        '200':
+          description: Transactions page.
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransactionListResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+    post:
+      tags:
+        - Transactions
+      summary: Create a transaction
+      description: Creates a transactional resource. Supports idempotent retries and request correlation.
+      operationId: createTransaction
+      security:
+        - bearerAuth:
+            - transactions:write
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTransactionRequest'
+      responses:
+        '201':
+          description: Transaction created.
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /transactions/{transactionId}:
+    get:
+      tags:
+        - Transactions
+      summary: Get a transaction
+      description: Retrieves a transactional resource by ID with request correlation.
+      operationId: getTransaction
+      security:
+        - bearerAuth:
+            - transactions:read
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/TransactionId'
+      responses:
+        '200':
+          description: Transaction found.
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+  /transactions/{transactionId}:cancel:
+    post:
+      tags:
+        - Transactions
+      summary: Cancel a transaction
+      description: Executes a transactional state change. Supports idempotent retries and request correlation.
+      operationId: cancelTransaction
+      security:
+        - bearerAuth:
+            - transactions:write
+      parameters:
+        - $ref: '#/components/parameters/CorrelationId'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/TransactionId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelTransactionRequest'
+      responses:
+        '200':
+          description: Transaction cancelled.
+          headers:
+            X-Correlation-ID:
+              $ref: '#/components/headers/CorrelationId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Transaction'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationFailed'
+        '429':
+          $ref: '#/components/responses/RateLimited'
+        '500':
+          $ref: '#/components/responses/InternalError'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Bearer token with endpoint-specific scopes.
+  parameters:
+    CorrelationId:
+      name: X-Correlation-ID
+      in: header
+      required: false
+      description: Client-provided request correlation ID. Responses include the resolved value.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+        pattern: '^[\x20-\x7E]+$'
+        examples:
+          - 7f4f0b1e-4b83-4f8c-9df2-8f1e2cdb6b24
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      description: Unique key for safe retries of mutating operations.
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 255
+    TransactionId:
+      name: transactionId
+      in: path
+      required: true
+      description: Opaque transaction identifier.
+      schema:
+        type: string
+        minLength: 1
+    PageSize:
+      name: page[size]
+      in: query
+      required: false
+      description: Maximum number of records to return.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 25
+    PageAfter:
+      name: page[after]
+      in: query
+      required: false
+      description: Opaque cursor for the next page.
+      schema:
+        type: string
+    PageBefore:
+      name: page[before]
+      in: query
+      required: false
+      description: Opaque cursor for the previous page.
+      schema:
+        type: string
+    FilterStatus:
+      name: filter[status]
+      in: query
+      required: false
+      description: Filter transactions by lifecycle status.
+      schema:
+        $ref: '#/components/schemas/TransactionStatus'
+    FilterCreatedAtGte:
+      name: filter[createdAt][gte]
+      in: query
+      required: false
+      description: Return transactions created at or after this RFC 3339 timestamp.
+      schema:
+        type: string
+        format: date-time
+    FilterCreatedAtLt:
+      name: filter[createdAt][lt]
+      in: query
+      required: false
+      description: Return transactions created before this RFC 3339 timestamp.
+      schema:
+        type: string
+        format: date-time
+    Sort:
+      name: sort
+      in: query
+      required: false
+      description: Comma-separated sort fields. Prefix with '-' for descending. Supported values are createdAt, -createdAt, id, and -id.
+      schema:
+        type: string
+        default: -createdAt,-id
+  headers:
+    CorrelationId:
+      description: Resolved request correlation ID, generated by the service when the request did not provide one.
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 128
+  responses:
+    BadRequest:
+      description: Bad request.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Unauthorized:
+      description: Missing or invalid authentication.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Forbidden:
+      description: Authenticated principal is not authorized for the operation.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    NotFound:
+      description: Resource not found or not visible to the caller.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    Conflict:
+      description: State conflict or idempotency conflict.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    ValidationFailed:
+      description: Request body failed semantic validation.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    RateLimited:
+      description: Rate limit exceeded.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema:
+            type: integer
+            minimum: 1
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+    InternalError:
+      description: Unexpected server error.
+      headers:
+        X-Correlation-ID:
+          $ref: '#/components/headers/CorrelationId'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+  schemas:
+    Transaction:
+      type: object
+      required:
+        - id
+        - status
+        - amount
+        - createdAt
+        - updatedAt
+      properties:
+        id:
+          type: string
+          description: Opaque transaction identifier.
+        status:
+          $ref: '#/components/schemas/TransactionStatus'
+        amount:
+          $ref: '#/components/schemas/Money'
+        description:
+          type: string
+          maxLength: 280
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+    TransactionStatus:
+      type: string
+      enum:
+        - pending
+        - authorized
+        - posted
+        - failed
+        - cancelled
+    Money:
+      type: object
+      required:
+        - currency
+        - value
+      properties:
+        currency:
+          type: string
+          minLength: 3
+          maxLength: 3
+          description: ISO 4217 currency code.
+          examples:
+            - USD
+        value:
+          type: string
+          pattern: '^-?\d+(\.\d{1,2})?$'
+          description: Decimal amount encoded as a string to preserve precision.
+          examples:
+            - '125.00'
+    CreateTransactionRequest:
+      type: object
+      required:
+        - amount
+      properties:
+        amount:
+          $ref: '#/components/schemas/Money'
+        description:
+          type: string
+          maxLength: 280
+    CancelTransactionRequest:
+      type: object
+      properties:
+        reason:
+          type: string
+          maxLength: 280
+    TransactionListResponse:
+      type: object
+      required:
+        - data
+        - page
+      properties:
+        data:
+          type: array
+          items:
+            $ref: '#/components/schemas/Transaction'
+        page:
+          $ref: '#/components/schemas/Page'
+    Page:
+      type: object
+      required:
+        - size
+        - hasMore
+      properties:
+        size:
+          type: integer
+          minimum: 0
+        nextCursor:
+          type:
+            - string
+            - 'null'
+        prevCursor:
+          type:
+            - string
+            - 'null'
+        hasMore:
+          type: boolean
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          $ref: '#/components/schemas/Error'
+    Error:
+      type: object
+      required:
+        - code
+        - message
+        - correlationId
+      properties:
+        code:
+          type: string
+          description: Stable machine-readable error code in UPPER_SNAKE_CASE.
+          examples:
+            - VALIDATION_FAILED
+        message:
+          type: string
+          description: Human-readable summary safe for client developers.
+          examples:
+            - The request body failed validation.
+        correlationId:
+          type: string
+          description: Resolved request correlation ID for tracing and support.
+          examples:
+            - 7f4f0b1e-4b83-4f8c-9df2-8f1e2cdb6b24
+        details:
+          type: array
+          items:
+            $ref: '#/components/schemas/ErrorDetail'
+    ErrorDetail:
+      type: object
+      additionalProperties: true
+      properties:
+        field:
+          type: string
+          description: Field path associated with the issue, when applicable.
+        issue:
+          type: string
+          description: Description of the field or domain issue.
