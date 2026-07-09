@@ -197,3 +197,63 @@ def test_international_itinerary_requires_document_metadata():
     assert invalid.body["error"]["fields"]["passengers[0].document.documentType"] == ["Document type must be passport or national_id."]
     assert valid.status_code == 201
     assert valid.body["data"]["passengerSnapshots"][0]["document"]["documentNumberLast4"] == "1A2B"
+
+
+def test_checkout_rejects_full_document_numbers_without_echoing_sensitive_values():
+    class InternationalProvider:
+        def getOfferDetails(self, offer_id):
+            return {
+                "id": offer_id,
+                "provider": "fixture",
+                "providerOfferId": "native-intl",
+                "itineraries": [
+                    {
+                        "id": "intl",
+                        "segments": [
+                            {
+                                "id": "seg_jfk_lhr",
+                                "marketingCarrier": "OA",
+                                "flightNumber": "OA7",
+                                "origin": "JFK",
+                                "destination": "LHR",
+                                "departsAt": "2031-07-01T20:00:00-04:00",
+                                "arrivesAt": "2031-07-02T08:00:00+01:00",
+                                "durationMinutes": 420,
+                            }
+                        ],
+                    }
+                ],
+                "pricing": {"total": {"amount": 90000, "currency": "USD"}},
+                "passengerCount": 1,
+                "cabin": "business",
+                "refundable": True,
+                "baggage": {"checkedBagsIncluded": 2},
+                "status": "available",
+                "expiresAt": "2031-07-01T07:45:00Z",
+            }
+
+    response = handle_create_booking_draft(
+        {
+            "offerId": "ofb_flt_intl",
+            "contact": VALID_CONTACT,
+            "passengers": [
+                {
+                    **VALID_ADULT,
+                    "gender": "unspecified",
+                    "document": {
+                        "documentType": "passport",
+                        "issuingCountry": "US",
+                        "nationalityCountry": "US",
+                        "expiresOn": "2035-01-01",
+                        "documentNumber": "P123456789",
+                    },
+                }
+            ],
+        },
+        provider=InternationalProvider(),
+    )
+
+    fields = response.body["error"]["fields"]
+    assert response.status_code == 400
+    assert fields["passengers[0].document.documentNumber"] == ["Full document numbers must be tokenized before submission; send documentNumberLast4 only."]
+    assert "P123456789" not in str(response.body)
