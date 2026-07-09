@@ -364,7 +364,7 @@ def _offer_payload(offer_id: str, request: FlightSearchRequest, *, missing_bagga
     passenger_count = request.adults + request.children + request.infants
     price = 28600 if offer_id.endswith("oneway") else 42800 if offer_id.endswith("multisegment") else 51200
     itinerary = _roundtrip_itineraries(request) if offer_id.endswith("roundtrip") else [_multisegment_itinerary() if offer_id.endswith("multisegment") else _oneway_itinerary(request)]
-    baggage = {} if missing_baggage else {"checkedBagsIncluded": 1}
+    baggage = {} if missing_baggage or offer_id.endswith("multisegment") else {"checkedBagsIncluded": 1}
     currency = "ZZZ" if offer_id.endswith("unexpected_currency") else "USD"
     return {
         "id": offer_id,
