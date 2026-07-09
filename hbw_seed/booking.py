@@ -8,11 +8,15 @@ same database-backed inventory rules as the public API contract layer.
 
 from __future__ import annotations
 
+import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from .audit import actor_from_user, record_audit_event, system_actor, user_actor
+from .auth import canAdministerHotel, canCancelReservation, canPayReservation, canViewReservation
+from .dto import admin_reservation_dto, guest_reservation_dto, payment_safe_dto
 from .public_api import ApiResponse, error_response, success_response
 
 MAX_GUESTS = 12
@@ -163,7 +167,7 @@ def create_pending_reservation(
             checkout_type = "authenticated" if user_id else "guest"
             connection.execute(
                 """
-                INSERT INTO reservations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO reservations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     reservation_id,
@@ -182,7 +186,25 @@ def create_pending_reservation(
                     created_at,
                     None,
                     HOLD_EXPIRES_AT,
+                    _generate_confirmation_secret(),
                 ),
+            )
+            record_audit_event(
+                connection,
+                actor=user_actor(user_id),
+                event_type="reservation.created",
+                entity_type="reservation",
+                entity_id=reservation_id,
+                metadata={
+                    "hotelId": hotel_id,
+                    "roomTypeId": room_type_id,
+                    "roomId": room_ids[0],
+                    "checkoutType": checkout_type,
+                    "totalCents": total_cents,
+                    "currency": room_type["currency"],
+                    "auditWritePolicy": "best effort; reservation correctness wins",
+                },
+                created_at=created_at,
             )
             connection.commit()
             row = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
@@ -244,6 +266,22 @@ def record_payment_webhook(
                     created_at,
                 ),
             )
+            record_audit_event(
+                connection,
+                actor=system_actor("webhook"),
+                event_type="payment.failed",
+                entity_type="payment",
+                entity_id=f"pay_{provider_reference}",
+                metadata={
+                    "reservationId": reservation_id,
+                    "provider": PAYMENT_PROVIDER,
+                    "amountCents": amount_cents,
+                    "currency": currency,
+                    "failureReason": "amount_or_currency_mismatch",
+                    "auditWritePolicy": "best effort; payment correctness wins",
+                },
+                created_at=created_at,
+            )
             connection.commit()
             raise BookingValidationError("Payment amount or currency does not match reservation total.")
 
@@ -268,20 +306,56 @@ def record_payment_webhook(
                 "UPDATE reservations SET status = 'confirmed', expires_at = NULL WHERE id = ?",
                 (reservation_id,),
             )
+            record_audit_event(
+                connection,
+                actor=system_actor("webhook"),
+                event_type="reservation.confirmed",
+                entity_type="reservation",
+                entity_id=reservation_id,
+                metadata={"paymentId": f"pay_{provider_reference}", "auditWritePolicy": "best effort; payment correctness wins"},
+                created_at=created_at,
+            )
+        record_audit_event(
+            connection,
+            actor=system_actor("webhook"),
+            event_type="payment.succeeded" if status == "captured" else "payment.failed",
+            entity_type="payment",
+            entity_id=f"pay_{provider_reference}",
+            metadata={
+                "reservationId": reservation_id,
+                "provider": PAYMENT_PROVIDER,
+                "amountCents": amount_cents,
+                "currency": currency,
+                "status": status,
+                "auditWritePolicy": "best effort; payment correctness wins",
+            },
+            created_at=created_at,
+        )
         connection.commit()
         return {"duplicate": False, "paymentId": f"pay_{provider_reference}", "status": status}
 
 
 def get_reservation_for_user(database_path: str, reservation_id: str, user_id: str) -> dict[str, Any]:
-    """Return a reservation only when the authenticated user owns it."""
+    """Return a guest-safe reservation only when the authenticated user owns it."""
 
     with _connect(database_path) as connection:
-        row = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+        row = _reservation_by_id(connection, reservation_id)
+        actor = _actor_by_id(connection, user_id)
         if row is None:
             raise LookupError("Reservation not found.")
-        if row["user_id"] != user_id:
-            raise PermissionError("Reservation belongs to another user.")
-        return _reservation_payload(row)
+        if not canViewReservation(actor, row) or actor is None or actor["role"] == "admin":
+            raise PermissionError("Reservation access denied.")
+        return guest_reservation_dto(row)
+
+
+def lookup_guest_reservation(database_path: str, reservation_id: str, confirmation_secret: str) -> dict[str, Any]:
+    """Return guest reservation details only with the non-guessable confirmation secret."""
+
+    with _connect(database_path) as connection:
+        row = _reservation_by_id(connection, reservation_id)
+        if row is None or row["checkout_type"] != "guest" or not secrets.compare_digest(row["confirmation_secret"], confirmation_secret):
+            raise LookupError("Reservation not found.")
+        return guest_reservation_dto(row)
 
 
 def cancel_reservation(
@@ -299,10 +373,13 @@ def cancel_reservation(
             row = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
             if row is None:
                 raise LookupError("Reservation not found.")
-            if row["user_id"] != user_id:
-                raise PermissionError("Reservation belongs to another user.")
+            actor = _actor_by_id(connection, user_id)
+            if not canViewReservation(actor, row) or actor is None or actor["role"] == "admin":
+                raise PermissionError("Reservation access denied.")
             if row["status"] not in {"confirmed", "pending_payment"}:
                 raise BookingConflict("Reservation is not eligible for cancellation.")
+            if not canCancelReservation(actor, row):
+                raise PermissionError("Reservation cancellation denied.")
 
             connection.execute(
                 "UPDATE reservations SET status = 'cancelled', cancelled_at = ? WHERE id = ?",
@@ -325,12 +402,283 @@ def cancel_reservation(
                     (refund_id, payment["id"], payment["amount_cents"], "Guest cancelled eligible reservation.", "succeeded", cancelled_at),
                 )
                 connection.execute("UPDATE payment_records SET status = 'refunded' WHERE id = ?", (payment["id"],))
+                record_audit_event(
+                    connection,
+                    actor=actor_from_user(actor),
+                    event_type="refund.created",
+                    entity_type="refund",
+                    entity_id=refund_id,
+                    metadata={
+                        "reservationId": reservation_id,
+                        "paymentId": payment["id"],
+                        "amountCents": payment["amount_cents"],
+                        "currency": payment["currency"],
+                        "auditWritePolicy": "best effort; cancellation correctness wins",
+                    },
+                    created_at=cancelled_at,
+                )
                 refund_payload = {"id": refund_id, "amount": format_money(payment["amount_cents"], payment["currency"]), "status": "succeeded"}
+            record_audit_event(
+                connection,
+                actor=actor_from_user(actor),
+                event_type="reservation.cancelled",
+                entity_type="reservation",
+                entity_id=reservation_id,
+                metadata={"refundId": refund_payload["id"] if refund_payload else None, "auditWritePolicy": "best effort; cancellation correctness wins"},
+                created_at=cancelled_at,
+            )
             connection.commit()
             cancelled = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
-            payload = _reservation_payload(cancelled)
-            payload["refund"] = refund_payload
-            return payload
+            return guest_reservation_dto(cancelled, refund=refund_payload)
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+
+def create_payment_intent(
+    database_path: str,
+    *,
+    payment_id: str,
+    reservation_id: str,
+    user_id: str,
+    provider_reference: str,
+    created_at: str = "2031-04-01T10:03:00Z",
+) -> dict[str, Any]:
+    """Create an authorized fixture payment intent and audit it without provider secrets."""
+
+    with _connect(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            reservation = _reservation_by_id(connection, reservation_id)
+            actor = _actor_by_id(connection, user_id)
+            if reservation is None:
+                raise LookupError("Reservation not found.")
+            if not canPayReservation(actor, reservation):
+                raise PermissionError("Payment access denied.")
+            existing = connection.execute("SELECT * FROM payment_records WHERE id = ?", (payment_id,)).fetchone()
+            if existing is not None:
+                connection.rollback()
+                return payment_safe_dto(existing)
+            connection.execute(
+                "INSERT INTO payment_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    payment_id,
+                    reservation_id,
+                    PAYMENT_PROVIDER,
+                    provider_reference,
+                    reservation["total_cents"],
+                    reservation["currency"],
+                    "authorized",
+                    created_at,
+                ),
+            )
+            record_audit_event(
+                connection,
+                actor=actor_from_user(actor),
+                event_type="payment_intent.created",
+                entity_type="payment",
+                entity_id=payment_id,
+                metadata={
+                    "reservationId": reservation_id,
+                    "provider": PAYMENT_PROVIDER,
+                    "amountCents": reservation["total_cents"],
+                    "currency": reservation["currency"],
+                    "auditWritePolicy": "best effort; payment correctness wins",
+                },
+                created_at=created_at,
+            )
+            connection.commit()
+            payment = connection.execute("SELECT * FROM payment_records WHERE id = ?", (payment_id,)).fetchone()
+            return payment_safe_dto(payment)
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+
+def admin_update_hotel(
+    database_path: str,
+    *,
+    hotel_id: str,
+    user_id: str,
+    changes: dict[str, Any],
+    updated_at: str = "2031-04-03T10:00:00Z",
+) -> dict[str, Any]:
+    """Update safe hotel admin fields and record a blocking audit event."""
+
+    allowed = {"name", "city", "country", "address", "star_rating", "is_searchable", "description"}
+    return _admin_update_entity(
+        database_path,
+        table="hotels",
+        entity_type="hotel",
+        entity_id=hotel_id,
+        user_id=user_id,
+        changes=changes,
+        allowed_fields=allowed,
+        hotel_id=hotel_id,
+        updated_at=updated_at,
+    )
+
+
+def admin_update_room_type(
+    database_path: str,
+    *,
+    room_type_id: str,
+    user_id: str,
+    changes: dict[str, Any],
+    updated_at: str = "2031-04-03T10:05:00Z",
+) -> dict[str, Any]:
+    """Update safe room-type admin fields and record a blocking audit event."""
+
+    allowed = {"name", "capacity", "nightly_rate_cents", "currency", "description"}
+    with _connect(database_path) as connection:
+        row = connection.execute("SELECT * FROM room_types WHERE id = ?", (room_type_id,)).fetchone()
+        if row is None:
+            raise LookupError("Room type not found.")
+        hotel_id = row["hotel_id"]
+    return _admin_update_entity(
+        database_path,
+        table="room_types",
+        entity_type="room_type",
+        entity_id=room_type_id,
+        user_id=user_id,
+        changes=changes,
+        allowed_fields=allowed,
+        hotel_id=hotel_id,
+        updated_at=updated_at,
+    )
+
+
+def admin_update_room(
+    database_path: str,
+    *,
+    room_id: str,
+    user_id: str,
+    changes: dict[str, Any],
+    updated_at: str = "2031-04-03T10:10:00Z",
+) -> dict[str, Any]:
+    """Update safe physical-room admin fields and record a blocking audit event."""
+
+    allowed = {"room_number", "floor", "status"}
+    with _connect(database_path) as connection:
+        row = connection.execute(
+            """
+            SELECT room.*, room_type.hotel_id
+            FROM rooms AS room
+            JOIN room_types AS room_type ON room_type.id = room.room_type_id
+            WHERE room.id = ?
+            """,
+            (room_id,),
+        ).fetchone()
+        if row is None:
+            raise LookupError("Room not found.")
+        hotel_id = row["hotel_id"]
+    return _admin_update_entity(
+        database_path,
+        table="rooms",
+        entity_type="room",
+        entity_id=room_id,
+        user_id=user_id,
+        changes=changes,
+        allowed_fields=allowed,
+        hotel_id=hotel_id,
+        updated_at=updated_at,
+    )
+
+
+def admin_create_availability_block(
+    database_path: str,
+    *,
+    block_id: str,
+    hotel_id: str,
+    user_id: str,
+    block_type: str,
+    starts_on: str,
+    ends_on: str,
+    reason: str,
+    room_type_id: str | None = None,
+    room_id: str | None = None,
+    created_at: str = "2031-04-03T10:15:00Z",
+) -> dict[str, Any]:
+    """Create an availability block with a blocking admin audit record."""
+
+    with _connect(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            actor = _actor_by_id(connection, user_id)
+            if not canAdministerHotel(actor, hotel_id):
+                raise PermissionError("Admin access required.")
+            connection.execute(
+                "INSERT INTO availability_blocks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (block_id, hotel_id, room_type_id, room_id, block_type, starts_on, ends_on, reason),
+            )
+            record_audit_event(
+                connection,
+                actor=actor_from_user(actor),
+                event_type="availability_block.created",
+                entity_type="availability_block",
+                entity_id=block_id,
+                metadata={
+                    "hotelId": hotel_id,
+                    "roomTypeId": room_type_id,
+                    "roomId": room_id,
+                    "blockType": block_type,
+                    "startsOn": starts_on,
+                    "endsOn": ends_on,
+                    "reason": reason,
+                    "auditWritePolicy": "blocking for admin inventory mutations",
+                },
+                created_at=created_at,
+                block_on_failure=True,
+            )
+            connection.commit()
+            return dict(connection.execute("SELECT * FROM availability_blocks WHERE id = ?", (block_id,)).fetchone())
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+
+def admin_delete_availability_block(
+    database_path: str,
+    *,
+    block_id: str,
+    user_id: str,
+    deleted_at: str = "2031-04-03T10:20:00Z",
+) -> bool:
+    """Delete an availability block with a blocking admin audit record."""
+
+    with _connect(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute("SELECT * FROM availability_blocks WHERE id = ?", (block_id,)).fetchone()
+            if row is None:
+                raise LookupError("Availability block not found.")
+            actor = _actor_by_id(connection, user_id)
+            if not canAdministerHotel(actor, row["hotel_id"]):
+                raise PermissionError("Admin access required.")
+            connection.execute("DELETE FROM availability_blocks WHERE id = ?", (block_id,))
+            record_audit_event(
+                connection,
+                actor=actor_from_user(actor),
+                event_type="availability_block.deleted",
+                entity_type="availability_block",
+                entity_id=block_id,
+                metadata={
+                    "hotelId": row["hotel_id"],
+                    "roomTypeId": row["room_type_id"],
+                    "roomId": row["room_id"],
+                    "blockType": row["block_type"],
+                    "startsOn": row["starts_on"],
+                    "endsOn": row["ends_on"],
+                    "auditWritePolicy": "blocking for admin inventory mutations",
+                },
+                created_at=deleted_at,
+                block_on_failure=True,
+            )
+            connection.commit()
+            return True
         except Exception:
             if connection.in_transaction:
                 connection.rollback()
@@ -371,8 +719,8 @@ def booking_api_get_reservation(database_path: str, reservation_id: str, user_id
 
     try:
         return success_response(get_reservation_for_user(database_path, reservation_id, user_id))
-    except PermissionError as exc:
-        return error_response(403, "forbidden", str(exc))
+    except PermissionError:
+        return error_response(403, "forbidden", "You are not authorized to access this reservation.")
     except LookupError as exc:
         return error_response(404, "not_found", str(exc))
 
@@ -382,12 +730,114 @@ def booking_api_cancel_reservation(database_path: str, reservation_id: str, user
 
     try:
         return success_response(cancel_reservation(database_path, reservation_id=reservation_id, user_id=user_id))
-    except PermissionError as exc:
-        return error_response(403, "forbidden", str(exc))
+    except PermissionError:
+        return error_response(403, "forbidden", "You are not authorized to cancel this reservation.")
     except LookupError as exc:
         return error_response(404, "not_found", str(exc))
     except BookingConflict as exc:
         return error_response(409, "reservation_conflict", str(exc))
+
+
+def booking_api_get_guest_reservation(database_path: str, reservation_id: str, confirmation_secret: str) -> ApiResponse:
+    """HTTP-shaped guest confirmation lookup guarded by a non-guessable secret."""
+
+    try:
+        return success_response(lookup_guest_reservation(database_path, reservation_id, confirmation_secret))
+    except LookupError:
+        return error_response(404, "not_found", "Reservation not found.")
+
+
+def booking_api_record_payment(database_path: str, payload: dict[str, Any], user_id: str) -> ApiResponse:
+    """HTTP-shaped payment adapter that authorizes caller and hides provider secrets."""
+
+    required = ["reservationId", "providerReference", "amountCents"]
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
+    with _connect(database_path) as connection:
+        reservation = _reservation_by_id(connection, payload["reservationId"])
+        actor = _actor_by_id(connection, user_id)
+        if reservation is None:
+            return error_response(404, "not_found", "Reservation not found.")
+        if not canPayReservation(actor, reservation):
+            return error_response(403, "forbidden", "You are not authorized to pay for this reservation.")
+    try:
+        result = record_payment_webhook(
+            database_path,
+            provider_reference=payload["providerReference"],
+            reservation_id=payload["reservationId"],
+            amount_cents=int(payload["amountCents"]),
+            currency=payload.get("currency", "USD"),
+            event_type=payload.get("eventType", "payment.succeeded"),
+        )
+    except BookingValidationError:
+        return error_response(400, "validation_error", "Payment could not be processed.")
+    with _connect(database_path) as connection:
+        payment = connection.execute("SELECT * FROM payment_records WHERE id = ?", (result["paymentId"],)).fetchone()
+        return success_response({"duplicate": result["duplicate"], "payment": payment_safe_dto(payment)}, status_code=200 if result["duplicate"] else 201)
+
+
+def booking_api_admin_get_reservation(database_path: str, reservation_id: str, user_id: str) -> ApiResponse:
+    """HTTP-shaped admin reservation endpoint guarded by hotel administration auth."""
+
+    with _connect(database_path) as connection:
+        row = _reservation_by_id(connection, reservation_id)
+        actor = _actor_by_id(connection, user_id)
+        if row is None:
+            return error_response(404, "not_found", "Reservation not found.")
+        if not canAdministerHotel(actor, row["hotel_id"]):
+            return error_response(403, "forbidden", "Admin access required.")
+        return success_response(admin_reservation_dto(row))
+
+
+def _admin_update_entity(
+    database_path: str,
+    *,
+    table: str,
+    entity_type: str,
+    entity_id: str,
+    user_id: str,
+    changes: dict[str, Any],
+    allowed_fields: set[str],
+    hotel_id: str,
+    updated_at: str,
+) -> dict[str, Any]:
+    unknown = sorted(set(changes) - allowed_fields)
+    if unknown:
+        raise BookingValidationError(f"Unsupported admin update field: {unknown[0]}.")
+    if not changes:
+        raise BookingValidationError("At least one change is required.")
+    with _connect(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            actor = _actor_by_id(connection, user_id)
+            if not canAdministerHotel(actor, hotel_id):
+                raise PermissionError("Admin access required.")
+            current = connection.execute(f"SELECT * FROM {table} WHERE id = ?", (entity_id,)).fetchone()
+            if current is None:
+                raise LookupError(f"{entity_type.replace('_', ' ').title()} not found.")
+            assignments = ", ".join(f"{field} = ?" for field in changes)
+            connection.execute(f"UPDATE {table} SET {assignments} WHERE id = ?", (*changes.values(), entity_id))
+            record_audit_event(
+                connection,
+                actor=actor_from_user(actor),
+                event_type=f"{entity_type}.updated",
+                entity_type=entity_type,
+                entity_id=entity_id,
+                metadata={
+                    "hotelId": hotel_id,
+                    "changedFields": sorted(changes),
+                    "auditWritePolicy": "blocking for admin inventory mutations",
+                },
+                created_at=updated_at,
+                block_on_failure=True,
+            )
+            connection.commit()
+            return dict(connection.execute(f"SELECT * FROM {table} WHERE id = ?", (entity_id,)).fetchone())
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
 
 
 def _connect(database_path: str) -> sqlite3.Connection:
@@ -396,23 +846,19 @@ def _connect(database_path: str) -> sqlite3.Connection:
     return connection
 
 
+def _actor_by_id(connection: sqlite3.Connection, user_id: str | None) -> sqlite3.Row | None:
+    if user_id is None:
+        return None
+    return connection.execute("SELECT * FROM users WHERE id = ?", (user_id,)).fetchone()
+
+
+def _reservation_by_id(connection: sqlite3.Connection, reservation_id: str) -> sqlite3.Row | None:
+    return connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+
+
+def _generate_confirmation_secret() -> str:
+    return f"cnf_{secrets.token_urlsafe(24)}"
+
+
 def _reservation_payload(row: sqlite3.Row, *, duplicate_request: bool = False) -> dict[str, Any]:
-    payload = {
-        "id": row["id"],
-        "hotelId": row["hotel_id"],
-        "roomTypeId": row["room_type_id"],
-        "roomId": row["room_id"],
-        "userId": row["user_id"],
-        "guestEmail": row["guest_email"],
-        "guestName": row["guest_name"],
-        "checkIn": row["check_in"],
-        "checkOut": row["check_out"],
-        "status": row["status"],
-        "checkoutType": row["checkout_type"],
-        "total": format_money(row["total_cents"], row["currency"]),
-        "expiresAt": row["expires_at"],
-        "cancelledAt": row["cancelled_at"],
-    }
-    if duplicate_request:
-        payload["duplicateRequest"] = True
-    return payload
+    return guest_reservation_dto(row, duplicate_request=duplicate_request)

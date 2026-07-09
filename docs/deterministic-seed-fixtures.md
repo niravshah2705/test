@@ -81,6 +81,27 @@ SQLite databases per case.
   mocked payment, confirmation lookup, cross-user access denial, and eligible
   cancellation.
 
+## Audit trail policy
+
+NIR-523 adds a structured `audit_records` schema with `actor_user_id`,
+`actor_type`, `event_type`, `entity_type`, `entity_id`, safe JSON `metadata`, and
+`created_at`. Runtime audit calls cover reservation creation/confirmation/
+cancellation, payment intent creation, payment success/failure, refund creation,
+hotel/room-type/room admin updates, and availability-block creation/deletion.
+Webhook payment events use `actor_type='webhook'`; background jobs can use
+`actor_type='system'` when no normal user exists.
+
+Audit metadata intentionally excludes card numbers, CVC/CVV, provider secrets,
+raw provider payloads, and full request payloads. Duplicate provider webhook
+references are idempotent: the payment result is returned as a duplicate and no
+second audit event is written for the already-processed provider event.
+
+Audit write failure policy prioritizes booking correctness. Reservation,
+payment, refund, cancellation, webhook, and background audit writes are
+best-effort and should not block the user/system action. Admin inventory
+mutations block on audit write failure because the audit record is part of the
+back-office change contract.
+
 ## Availability query expectation
 
 A room is available when it is active, overlaps no hotel/room-type/room-level

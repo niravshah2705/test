@@ -16,6 +16,8 @@ from math import ceil
 from typing import Any
 from urllib.parse import parse_qs
 
+from .dto import public_hotel_detail_dto, public_hotel_summary_dto, public_room_type_dto
+
 MAX_PAGE_SIZE = 50
 DEFAULT_PAGE = 1
 DEFAULT_PAGE_SIZE = 20
@@ -110,19 +112,14 @@ def search_hotels(database_path: str, query: dict[str, str]) -> ApiResponse:
                 continue
             minimum_price = min((room_type["price"] for room_type in room_types), key=lambda price: price["amountCents"])
             matching_hotels.append(
-                {
-                    "slug": hotel["slug"],
-                    "name": hotel["name"],
-                    "city": hotel["city"],
-                    "country": hotel["country"],
-                    "starRating": hotel["star_rating"],
-                    "description": hotel["description"],
-                    "images": _hotel_images(connection, hotel["id"]),
-                    "amenities": _amenities(connection, hotel["id"]),
-                    "reviewSummary": _review_summary(connection, hotel["id"]),
-                    "price": minimum_price,
-                    "availableRoomTypes": len(room_types),
-                }
+                public_hotel_summary_dto(
+                    hotel,
+                    images=_hotel_images(connection, hotel["id"]),
+                    amenities=_amenities(connection, hotel["id"]),
+                    review_summary=_review_summary(connection, hotel["id"]),
+                    minimum_price=minimum_price,
+                    available_room_types=len(room_types),
+                )
             )
 
     total = len(matching_hotels)
@@ -158,21 +155,15 @@ def get_hotel_detail(database_path: str, slug: str) -> ApiResponse:
             return _not_found()
 
         room_types = _public_room_types(connection, hotel["id"], None, None, 1)
-        data = {
-            "slug": hotel["slug"],
-            "name": hotel["name"],
-            "city": hotel["city"],
-            "country": hotel["country"],
-            "address": hotel["address"],
-            "starRating": hotel["star_rating"],
-            "description": hotel["description"],
-            "images": _hotel_images(connection, hotel["id"]),
-            "amenities": _amenities(connection, hotel["id"]),
-            "policies": _policies(connection, hotel["id"]),
-            "reviews": _reviews(connection, hotel["id"]),
-            "reviewSummary": _review_summary(connection, hotel["id"]),
-            "roomTypes": room_types,
-        }
+        data = public_hotel_detail_dto(
+            hotel,
+            images=_hotel_images(connection, hotel["id"]),
+            amenities=_amenities(connection, hotel["id"]),
+            policies=_policies(connection, hotel["id"]),
+            reviews=_reviews(connection, hotel["id"]),
+            review_summary=_review_summary(connection, hotel["id"]),
+            room_types=room_types,
+        )
     return success_response(data)
 
 
@@ -421,21 +412,7 @@ def _public_room_types(
         available_rooms = _available_room_count(connection, hotel_id, row["id"], check_in, check_out)
         if check_in is not None and check_out is not None and available_rooms <= 0:
             continue
-        room_types.append(
-            {
-                "code": row["id"],
-                "name": row["name"],
-                "capacity": row["capacity"],
-                "description": row["description"],
-                "price": {
-                    "amountCents": row["nightly_rate_cents"],
-                    "currency": row["currency"],
-                    "unit": "night",
-                },
-                "images": _room_images(connection, row["id"]),
-                "availableRooms": available_rooms,
-            }
-        )
+        room_types.append(public_room_type_dto(row, images=_room_images(connection, row["id"]), available_rooms=available_rooms))
     return room_types
 
 

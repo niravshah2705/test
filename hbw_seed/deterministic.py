@@ -154,7 +154,8 @@ SCHEMA_STATEMENTS = [
         currency TEXT NOT NULL DEFAULT 'USD',
         created_at TEXT NOT NULL,
         cancelled_at TEXT,
-        expires_at TEXT
+        expires_at TEXT,
+        confirmation_secret TEXT NOT NULL
     )
     """,
     """
@@ -195,9 +196,10 @@ SCHEMA_STATEMENTS = [
     CREATE TABLE audit_records (
         id TEXT PRIMARY KEY,
         actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        actor_type TEXT NOT NULL CHECK (actor_type IN ('guest', 'admin', 'system', 'webhook')),
+        event_type TEXT NOT NULL,
         entity_type TEXT NOT NULL,
         entity_id TEXT NOT NULL,
-        action TEXT NOT NULL,
         metadata TEXT NOT NULL,
         created_at TEXT NOT NULL
     )
@@ -325,17 +327,17 @@ REVIEWS = [
 
 RESERVATIONS = [
     # Sold-out Deluxe King: both physical rooms confirmed for the search window.
-    ("res_bay_king_guest_confirmed", "htl_sfo_bay", "rt_bay_king", "room_bay_king_501", None, "walkup@example.test", "Wanda Walkup", "2031-06-10", "2031-06-12", "confirmed", "guest", 48000, "USD", "2031-03-01T10:00:00Z", None, None),
-    ("res_bay_king_auth_confirmed", "htl_sfo_bay", "rt_bay_king", "room_bay_king_502", "usr_guest", "guest@example.test", "Gale Guest", "2031-06-10", "2031-06-12", "confirmed", "authenticated", 48000, "USD", "2031-03-01T11:00:00Z", None, None),
+    ("res_bay_king_guest_confirmed", "htl_sfo_bay", "rt_bay_king", "room_bay_king_501", None, "walkup@example.test", "Wanda Walkup", "2031-06-10", "2031-06-12", "confirmed", "guest", 48000, "USD", "2031-03-01T10:00:00Z", None, None, "cnf_9e45f6c9baf04c2c8d3f1a72"),
+    ("res_bay_king_auth_confirmed", "htl_sfo_bay", "rt_bay_king", "room_bay_king_502", "usr_guest", "guest@example.test", "Gale Guest", "2031-06-10", "2031-06-12", "confirmed", "authenticated", 48000, "USD", "2031-03-01T11:00:00Z", None, None, "cnf_1f2b7a8d0e6946bea6f9c831"),
     # Partial availability: one suite occupied, one suite still bookable.
-    ("res_bay_suite_confirmed", "htl_sfo_bay", "rt_bay_suite", "room_bay_suite_601", "usr_guest", "guest@example.test", "Gale Guest", "2031-06-10", "2031-06-12", "confirmed", "authenticated", 84000, "USD", "2031-03-02T10:00:00Z", None, None),
+    ("res_bay_suite_confirmed", "htl_sfo_bay", "rt_bay_suite", "room_bay_suite_601", "usr_guest", "guest@example.test", "Gale Guest", "2031-06-10", "2031-06-12", "confirmed", "authenticated", 84000, "USD", "2031-03-02T10:00:00Z", None, None, "cnf_7b0d19f643524acdb122d6aa"),
     # Pending payment holds availability until checkout flow succeeds or expires.
-    ("res_garden_family_pending", "htl_sfo_garden", "rt_garden_family", "room_garden_family_301", "usr_guest", "guest@example.test", "Gale Guest", "2031-06-10", "2031-06-12", "pending_payment", "authenticated", 52000, "USD", "2031-03-03T10:00:00Z", None, "2031-06-09T23:59:00Z"),
+    ("res_garden_family_pending", "htl_sfo_garden", "rt_garden_family", "room_garden_family_301", "usr_guest", "guest@example.test", "Gale Guest", "2031-06-10", "2031-06-12", "pending_payment", "authenticated", 52000, "USD", "2031-03-03T10:00:00Z", None, "2031-06-09T23:59:00Z", "cnf_a6d0c3e91f8b41eba5d7290f"),
     # Cancelled and expired reservations should not consume availability.
-    ("res_bay_suite_cancelled", "htl_sfo_bay", "rt_bay_suite", "room_bay_suite_602", None, "cancelled@example.test", "Casey Cancelled", "2031-06-10", "2031-06-12", "cancelled", "guest", 84000, "USD", "2031-03-04T10:00:00Z", "2031-03-05T10:00:00Z", None),
-    ("res_garden_queen_expired", "htl_sfo_garden", "rt_garden_queen", "room_garden_queen_202", None, "expired@example.test", "Elliot Expired", "2031-06-10", "2031-06-12", "expired", "guest", 36000, "USD", "2031-03-05T10:00:00Z", None, "2031-03-05T10:15:00Z"),
+    ("res_bay_suite_cancelled", "htl_sfo_bay", "rt_bay_suite", "room_bay_suite_602", None, "cancelled@example.test", "Casey Cancelled", "2031-06-10", "2031-06-12", "cancelled", "guest", 84000, "USD", "2031-03-04T10:00:00Z", "2031-03-05T10:00:00Z", None, "cnf_5c52f2f723cb4de585ed2479"),
+    ("res_garden_queen_expired", "htl_sfo_garden", "rt_garden_queen", "room_garden_queen_202", None, "expired@example.test", "Elliot Expired", "2031-06-10", "2031-06-12", "expired", "guest", 36000, "USD", "2031-03-05T10:00:00Z", None, "2031-03-05T10:15:00Z", "cnf_c8a413dc9f9f4777a0e8ab36"),
     # Confirmed reservation on dates not covered by the main search window.
-    ("res_loft_double_future", "htl_nyc_loft", "rt_loft_double", "room_loft_double_901", "usr_guest", "guest@example.test", "Gale Guest", "2031-07-01", "2031-07-03", "confirmed", "authenticated", 60000, "USD", "2031-03-06T10:00:00Z", None, None),
+    ("res_loft_double_future", "htl_nyc_loft", "rt_loft_double", "room_loft_double_901", "usr_guest", "guest@example.test", "Gale Guest", "2031-07-01", "2031-07-03", "confirmed", "authenticated", 60000, "USD", "2031-03-06T10:00:00Z", None, None, "cnf_ee92874cf51b427bb68bb5de"),
 ]
 
 AVAILABILITY_BLOCKS = [
@@ -357,10 +359,10 @@ REFUNDS = [
 ]
 
 AUDITS = [
-    ("aud_seed_run", "usr_admin", "seed_dataset", "deterministic_hbw", "reset_and_seed", "{\"source\":\"NIR-510\"}", "2031-03-01T00:00:00Z"),
-    ("aud_hotel_closure", "usr_admin", "availability_block", "blk_loft_hotel_closed", "created", "{\"scenario\":\"hotel-level closure\"}", "2031-03-01T00:01:00Z"),
-    ("aud_room_type_closure", "usr_admin", "availability_block", "blk_garden_queen_closed", "created", "{\"scenario\":\"room-type closure\"}", "2031-03-01T00:02:00Z"),
-    ("aud_refund", "usr_admin", "refund", "ref_bay_suite_cancelled", "created", "{\"scenario\":\"cancelled reservation refund\"}", "2031-03-05T10:06:00Z"),
+    ("aud_seed_run", "usr_admin", "admin", "seed.reset", "seed_dataset", "deterministic_hbw", '{"source":"NIR-510"}', "2031-03-01T00:00:00Z"),
+    ("aud_hotel_closure", "usr_admin", "admin", "availability_block.created", "availability_block", "blk_loft_hotel_closed", '{"scenario":"hotel-level closure","auditWritePolicy":"blocking for admin inventory mutations"}', "2031-03-01T00:01:00Z"),
+    ("aud_room_type_closure", "usr_admin", "admin", "availability_block.created", "availability_block", "blk_garden_queen_closed", '{"scenario":"room-type closure","auditWritePolicy":"blocking for admin inventory mutations"}', "2031-03-01T00:02:00Z"),
+    ("aud_refund", "usr_admin", "admin", "refund.created", "refund", "ref_bay_suite_cancelled", '{"scenario":"cancelled reservation refund","auditWritePolicy":"best effort; cancellation correctness wins"}', "2031-03-05T10:06:00Z"),
 ]
 
 
