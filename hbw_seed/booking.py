@@ -18,6 +18,7 @@ from typing import Any
 from .audit import actor_from_user, record_audit_event, system_actor, user_actor
 from .auth import canAdministerHotel, canCancelReservation, canPayReservation, canViewReservation
 from .dto import admin_reservation_dto, guest_reservation_dto, payment_safe_dto
+from .notification import BOOKING_CONFIRMATION, BOOKING_FAILED, BOOKING_PENDING, PAYMENT_FAILED, NotificationDispatcher, create_booking_notification
 from .public_api import ApiResponse, error_response, success_response
 
 MAX_GUESTS = 12
@@ -147,6 +148,7 @@ def create_pending_reservation(
     adults: int,
     children: int,
     created_at: str = "2031-04-01T10:00:00Z",
+    dispatcher: NotificationDispatcher | None = None,
 ) -> dict[str, Any]:
     """Create a pending reservation transactionally against current inventory."""
 
@@ -215,6 +217,7 @@ def create_pending_reservation(
                 booking_id=reservation_id,
                 created_at=created_at,
             )
+            create_booking_notification(connection, reservation_id, BOOKING_PENDING, dispatcher=dispatcher, created_at=created_at)
             connection.commit()
             row = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
             return _reservation_payload(row, duplicate_request=False)
@@ -224,7 +227,7 @@ def create_pending_reservation(
             raise
 
 
-def expire_pending_reservation(database_path: str, reservation_id: str, *, now: str) -> bool:
+def expire_pending_reservation(database_path: str, reservation_id: str, *, now: str, dispatcher: NotificationDispatcher | None = None) -> bool:
     """Expire a pending payment hold once its deterministic expiry has passed."""
 
     with _connect(database_path) as connection:
@@ -232,6 +235,7 @@ def expire_pending_reservation(database_path: str, reservation_id: str, *, now: 
         if row is None or row["status"] != "pending_payment" or row["expires_at"] is None or now <= row["expires_at"]:
             return False
         connection.execute("UPDATE reservations SET status = 'expired' WHERE id = ?", (reservation_id,))
+        create_booking_notification(connection, reservation_id, BOOKING_FAILED, dispatcher=dispatcher, created_at=now)
         connection.commit()
         return True
 
@@ -245,6 +249,7 @@ def record_payment_webhook(
     currency: str = "USD",
     event_type: str = "payment.succeeded",
     created_at: str = "2031-04-01T10:05:00Z",
+    dispatcher: NotificationDispatcher | None = None,
 ) -> dict[str, Any]:
     """Persist successful/failed payment provider events idempotently."""
 
@@ -293,6 +298,7 @@ def record_payment_webhook(
                 payment_id=f"pay_{provider_reference}",
                 created_at=created_at,
             )
+            create_booking_notification(connection, reservation_id, PAYMENT_FAILED, dispatcher=dispatcher, created_at=created_at)
             connection.commit()
             raise BookingValidationError("Payment amount or currency does not match reservation total.")
 
@@ -317,6 +323,7 @@ def record_payment_webhook(
                 "UPDATE reservations SET status = 'confirmed', expires_at = NULL WHERE id = ?",
                 (reservation_id,),
             )
+            create_booking_notification(connection, reservation_id, BOOKING_CONFIRMATION, dispatcher=dispatcher, created_at=created_at)
             record_audit_event(
                 connection,
                 actor=system_actor("webhook"),
@@ -329,6 +336,8 @@ def record_payment_webhook(
                 payment_id=f"pay_{provider_reference}",
                 created_at=created_at,
             )
+        if status != "captured":
+            create_booking_notification(connection, reservation_id, PAYMENT_FAILED, dispatcher=dispatcher, created_at=created_at)
         record_audit_event(
             connection,
             actor=system_actor("webhook"),
@@ -867,6 +876,7 @@ def booking_api_create_reservation(database_path: str, payload: dict[str, Any]) 
             check_out=payload["checkOut"],
             adults=int(payload["adults"]),
             children=int(payload["children"]),
+            dispatcher=payload.get("notificationDispatcher"),
         )
     except BookingConflict as exc:
         return error_response(409, "inventory_conflict", str(exc))
@@ -931,6 +941,7 @@ def booking_api_record_payment(database_path: str, payload: dict[str, Any], user
             amount_cents=int(payload["amountCents"]),
             currency=payload.get("currency", "USD"),
             event_type=payload.get("eventType", "payment.succeeded"),
+            dispatcher=payload.get("notificationDispatcher"),
         )
     except BookingValidationError:
         return error_response(400, "validation_error", "Payment could not be processed.")
