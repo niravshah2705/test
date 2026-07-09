@@ -23,6 +23,7 @@ from hbw_seed.booking import (
     booking_api_get_guest_reservation,
     booking_api_get_reservation,
     booking_api_record_payment,
+    booking_api_refresh_reservation_status,
     calculate_total_cents,
     create_payment_intent,
     cancel_reservation,
@@ -32,8 +33,10 @@ from hbw_seed.booking import (
     get_reservation_for_user,
     parse_stay_dates,
     record_payment_webhook,
+    refresh_reservation_status,
     validate_occupancy,
 )
+from hbw_seed.flights import DeterministicMockFlightProvider
 from hbw_seed.public_api import handle_get
 
 
@@ -613,6 +616,172 @@ def test_payment_api_authorizes_owner_and_hides_provider_reference(tmp_path):
     assert authorized.body["data"]["payment"]["status"] == "captured"
     assert "providerReference" not in authorized.body["data"]["payment"]
     assert "providerSecret" not in authorized.body["data"]["payment"]
+
+
+class StaticOrderStatusProvider(DeterministicMockFlightProvider):
+    def __init__(self, status):
+        self.status = status
+        self.calls = 0
+
+    def getOrderStatus(self, order_id):
+        self.calls += 1
+        return {
+            "id": order_id,
+            "offerId": "ofb_flt_oneway",
+            "provider": "deterministic_mock_air",
+            "providerOrderId": order_id,
+            "pricing": {"total": {"amount": 52000, "currency": "USD"}},
+            "status": self.status,
+        }
+
+
+def create_refresh_fixture(database, reservation_id="res_refresh", *, payment_status="authorized", provider_status="ticketing_pending"):
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id=reservation_id,
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "INSERT INTO payment_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"pay_{reservation_id}", reservation_id, "fixture_gateway", f"fx_{reservation_id}", reservation["total"]["amountCents"], "USD", payment_status, "2031-04-01T10:05:00Z"),
+        )
+        connection.execute(
+            "INSERT INTO provider_orders VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (f"ord_{reservation_id}", reservation_id, "deterministic_mock_air", f"ord_{reservation_id}", "ofb_flt_oneway", reservation["total"]["amountCents"], "USD", provider_status, "2031-04-01T10:06:00Z", "2031-04-01T10:06:00Z"),
+        )
+        connection.commit()
+    return reservation
+
+
+def test_refresh_status_keeps_payment_pending_safe_and_retryable(tmp_path):
+    database = seeded_database(tmp_path)
+    create_refresh_fixture(database, "res_refresh_payment_pending")
+
+    result = refresh_reservation_status(
+        str(database),
+        reservation_id="res_refresh_payment_pending",
+        payment_status_provider=lambda payment: "processing",
+        flight_provider=StaticOrderStatusProvider("ticketed"),
+    )
+
+    assert result["reservation"]["status"] == "pending_payment"
+    assert result["payment"]["status"] == "authorized"
+    assert result["providerOrder"]["status"] == "ticketed"
+    assert result["retryable"] is True
+
+
+def test_refresh_status_moves_payment_captured_provider_pending_to_pending_provider(tmp_path):
+    database = seeded_database(tmp_path)
+    create_refresh_fixture(database, "res_refresh_provider_pending")
+
+    result = refresh_reservation_status(
+        str(database),
+        reservation_id="res_refresh_provider_pending",
+        payment_status_provider=lambda payment: "succeeded",
+        flight_provider=StaticOrderStatusProvider("ticketing_pending"),
+    )
+
+    assert result["reservation"]["status"] == "pending_provider"
+    assert result["payment"]["status"] == "captured"
+    assert result["providerOrder"]["status"] == "ticketing_pending"
+    assert result["changed"] is True
+
+
+def test_refresh_status_confirms_when_payment_and_provider_are_confirmed(tmp_path):
+    database = seeded_database(tmp_path)
+    create_refresh_fixture(database, "res_refresh_confirmed")
+
+    result = refresh_reservation_status(
+        str(database),
+        reservation_id="res_refresh_confirmed",
+        payment_status_provider=lambda payment: "captured",
+        flight_provider=StaticOrderStatusProvider("ticketed"),
+    )
+
+    assert result["reservation"]["status"] == "confirmed"
+    assert result["retryable"] is False
+    events = [row["event_type"] for row in audit_rows(database, "res_refresh_confirmed")]
+    assert "provider_order.ticketed" in events
+    assert "reservation.confirmed" in events
+
+
+def test_refresh_status_fails_for_provider_or_payment_failure(tmp_path):
+    database = seeded_database(tmp_path)
+    create_refresh_fixture(database, "res_refresh_provider_failed", payment_status="captured")
+    create_refresh_fixture(database, "res_refresh_payment_failed")
+
+    provider_failed = refresh_reservation_status(
+        str(database),
+        reservation_id="res_refresh_provider_failed",
+        flight_provider=StaticOrderStatusProvider("failed"),
+    )
+    payment_failed = refresh_reservation_status(
+        str(database),
+        reservation_id="res_refresh_payment_failed",
+        payment_status_provider=lambda payment: "declined",
+        flight_provider=StaticOrderStatusProvider("ticketed"),
+    )
+
+    assert provider_failed["reservation"]["status"] == "failed"
+    assert provider_failed["providerOrder"]["status"] == "failed"
+    assert payment_failed["reservation"]["status"] == "failed"
+    assert payment_failed["payment"]["status"] == "voided"
+
+
+def test_refresh_status_is_idempotent_for_duplicate_and_terminal_refreshes(tmp_path):
+    database = seeded_database(tmp_path)
+    create_refresh_fixture(database, "res_refresh_duplicate")
+
+    first = refresh_reservation_status(
+        str(database),
+        reservation_id="res_refresh_duplicate",
+        payment_status_provider=lambda payment: "captured",
+        flight_provider=StaticOrderStatusProvider("ticketed"),
+    )
+    second = refresh_reservation_status(
+        str(database),
+        reservation_id="res_refresh_duplicate",
+        payment_status_provider=lambda payment: "captured",
+        flight_provider=StaticOrderStatusProvider("ticketed"),
+    )
+    terminal = refresh_reservation_status(str(database), reservation_id="res_bay_king_auth_confirmed")
+
+    assert first["reservation"]["status"] == "confirmed"
+    assert second["reservation"]["status"] == "confirmed"
+    assert second["changed"] is False
+    assert terminal["terminal"] is True
+    assert terminal["changed"] is False
+    rows = audit_rows(database, "res_refresh_duplicate")
+    assert sum(1 for row in rows if row["event_type"] == "reservation.confirmed") == 1
+
+
+def test_refresh_status_unknown_external_status_and_api_are_safe(tmp_path):
+    database = seeded_database(tmp_path)
+    create_refresh_fixture(database, "res_refresh_unknown")
+
+    unknown = booking_api_refresh_reservation_status(
+        str(database),
+        "res_refresh_unknown",
+        "usr_guest",
+        payment_status_provider=lambda payment: "mystery",
+        flight_provider=StaticOrderStatusProvider("strange"),
+    )
+    forbidden = booking_api_refresh_reservation_status(str(database), "res_refresh_unknown", "usr_admin")
+
+    assert unknown.status_code == 200
+    assert unknown.body["data"]["reservation"]["status"] == "pending_payment"
+    assert unknown.body["data"]["retryable"] is True
+    assert unknown.body["data"]["steps"][0]["action"] == "unknown_retryable"
+    assert forbidden.status_code == 403
 
 
 def test_admin_endpoint_rejects_non_admin_and_returns_operational_dto_only_to_admin(tmp_path):

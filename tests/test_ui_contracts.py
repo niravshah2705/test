@@ -97,7 +97,10 @@ def test_account_confirmation_cancellation_and_admin_authorization_states_are_ex
     cancellation = {state["status"] for state in build_page_states("cancellation")}
     admin_hotels = {state["status"] for state in build_page_states("admin_hotels")}
 
-    assert {"loading", "not_found", "forbidden", "error", "success", "retry"} <= confirmation
+    assert {"loading", "pending", "not_found", "forbidden", "error", "success", "retry"} <= confirmation
+    pending = next(state for state in build_page_states("reservation_confirmation") if state["status"] == "pending")
+    assert pending["actions"] == [{"label": "Refresh status", "href": "/bookings/:id/refresh-status", "variant": "primary", "method": "POST"}]
+    assert "poll POST /bookings/:id/refresh-status" in pending["message"]
     assert {"loading", "empty", "not_found", "forbidden", "error", "success", "retry"} <= account
     assert {"loading", "validation_error", "conflict", "not_found", "forbidden", "error", "success", "retry"} <= cancellation
     assert {"loading", "empty", "validation_error", "forbidden", "error", "success", "retry"} <= admin_hotels

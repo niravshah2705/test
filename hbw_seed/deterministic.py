@@ -30,6 +30,7 @@ SCHEMA_STATEMENTS = [
     "DROP TABLE IF EXISTS auth_sessions",
     "DROP TABLE IF EXISTS audit_events",
     "DROP TABLE IF EXISTS refunds",
+    "DROP TABLE IF EXISTS provider_orders",
     "DROP TABLE IF EXISTS payment_records",
     "DROP TABLE IF EXISTS availability_blocks",
     "DROP TABLE IF EXISTS reservations",
@@ -211,7 +212,7 @@ SCHEMA_STATEMENTS = [
         guest_name TEXT NOT NULL,
         check_in TEXT NOT NULL,
         check_out TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('confirmed', 'pending_payment', 'cancelled', 'expired')),
+        status TEXT NOT NULL CHECK (status IN ('confirmed', 'pending_payment', 'pending_provider', 'failed', 'cancelled', 'expired')),
         checkout_type TEXT NOT NULL CHECK (checkout_type IN ('guest', 'authenticated')),
         total_cents INTEGER NOT NULL,
         currency TEXT NOT NULL DEFAULT 'USD',
@@ -243,6 +244,20 @@ SCHEMA_STATEMENTS = [
         currency TEXT NOT NULL DEFAULT 'USD',
         status TEXT NOT NULL CHECK (status IN ('authorized', 'captured', 'voided', 'refunded')),
         created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE provider_orders (
+        id TEXT PRIMARY KEY,
+        reservation_id TEXT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        provider_reference TEXT NOT NULL,
+        offer_id TEXT,
+        amount_cents INTEGER NOT NULL,
+        currency TEXT NOT NULL DEFAULT 'USD',
+        status TEXT NOT NULL CHECK (status IN ('ticketing_pending', 'ticketed', 'failed')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
     )
     """,
     """
@@ -442,6 +457,10 @@ PAYMENTS = [
     ("pay_bay_suite_cancelled", "res_bay_suite_cancelled", "fixture_gateway", "fx_refund_guest_0005", 84000, "USD", "refunded", "2031-03-04T10:05:00Z"),
 ]
 
+PROVIDER_ORDERS = [
+    ("ord_res_garden_family_pending", "res_garden_family_pending", "deterministic_mock_air", "ord_pending", "ofb_flt_oneway", 52000, "USD", "ticketing_pending", "2031-03-03T10:06:00Z", "2031-03-03T10:06:00Z"),
+]
+
 REFUNDS = [
     ("ref_bay_suite_cancelled", "pay_bay_suite_cancelled", 84000, "Guest cancelled within deterministic fixture window.", "succeeded", "2031-03-05T10:05:00Z"),
 ]
@@ -494,6 +513,7 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
         _insert_many(connection, "reservations", RESERVATIONS)
         _insert_many(connection, "availability_blocks", AVAILABILITY_BLOCKS)
         _insert_many(connection, "payment_records", PAYMENTS)
+        _insert_many(connection, "provider_orders", PROVIDER_ORDERS)
         _insert_many(connection, "refunds", REFUNDS)
         _insert_many(connection, "audit_events", AUDITS)
         connection.commit()

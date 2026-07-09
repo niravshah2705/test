@@ -13,11 +13,12 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date
 from math import ceil
-from typing import Any
+from typing import Any, Callable
 
 from .audit import actor_from_user, record_audit_event, system_actor, user_actor
 from .auth import canAdministerHotel, canCancelReservation, canPayReservation, canViewReservation
 from .dto import admin_reservation_dto, guest_reservation_dto, payment_safe_dto
+from .flights import FlightBookingService, FlightProvider, FlightProviderError
 from .public_api import ApiResponse, error_response, success_response
 
 MAX_GUESTS = 12
@@ -26,8 +27,11 @@ PAYMENT_PROVIDER = "fixture_gateway"
 ADMIN_MAX_PAGE_SIZE = 50
 ADMIN_DEFAULT_PAGE = 1
 ADMIN_DEFAULT_PAGE_SIZE = 20
-CANCELLABLE_STATUSES = {"confirmed", "pending_payment"}
-
+CANCELLABLE_STATUSES = {"confirmed", "pending_payment", "pending_provider"}
+TERMINAL_RESERVATION_STATUSES = {"confirmed", "failed", "cancelled", "expired"}
+REFRESHABLE_RESERVATION_STATUSES = {"pending_payment", "pending_provider"}
+PAYMENT_REFRESHABLE_STATUSES = {"authorized"}
+PROVIDER_REFRESHABLE_STATUSES = {"ticketing_pending"}
 
 
 @dataclass(frozen=True)
@@ -350,6 +354,197 @@ def record_payment_webhook(
         )
         connection.commit()
         return {"duplicate": False, "paymentId": f"pay_{provider_reference}", "status": status}
+
+
+def refresh_reservation_status(
+    database_path: str,
+    *,
+    reservation_id: str,
+    payment_status_provider: Callable[[sqlite3.Row], str | None] | None = None,
+    flight_provider: FlightProvider | None = None,
+    refreshed_at: str = "2031-04-01T10:07:00Z",
+) -> dict[str, Any]:
+    """Refresh delayed payment/provider states through safe idempotent transitions."""
+
+    with _connect(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            reservation = _reservation_by_id(connection, reservation_id)
+            if reservation is None:
+                raise LookupError("Reservation not found.")
+
+            payment = _latest_payment(connection, reservation_id)
+            provider_order = _latest_provider_order(connection, reservation_id)
+            refresh_steps: list[dict[str, Any]] = []
+            state_changed = False
+            original_status = reservation["status"]
+
+            if reservation["status"] in TERMINAL_RESERVATION_STATUSES:
+                connection.rollback()
+                return _refresh_payload(reservation, payment, provider_order, changed=False, terminal=True, steps=[])
+
+            payment_status = payment["status"] if payment is not None else None
+            provider_status = provider_order["status"] if provider_order is not None else None
+
+            if payment is not None and payment_status in PAYMENT_REFRESHABLE_STATUSES and reservation["status"] in REFRESHABLE_RESERVATION_STATUSES:
+                external_payment_status = payment_status_provider(payment) if payment_status_provider is not None else None
+                payment_step = {"source": "payment", "previousStatus": payment_status, "externalStatus": external_payment_status, "action": "unchanged"}
+                normalized_payment_status = _normalize_payment_refresh_status(external_payment_status)
+                if normalized_payment_status == "captured":
+                    connection.execute("UPDATE payment_records SET status = 'captured' WHERE id = ?", (payment["id"],))
+                    payment_status = "captured"
+                    state_changed = True
+                    payment_step["action"] = "captured"
+                    record_audit_event(
+                        connection,
+                        actor=system_actor("refresh-status"),
+                        event_type="payment.succeeded",
+                        entity_type="payment",
+                        entity_id=payment["id"],
+                        metadata={
+                            "reservationId": reservation_id,
+                            "provider": payment["provider"],
+                            "previousStatus": payment["status"],
+                            "status": "captured",
+                            "source": "refresh-status",
+                            "auditWritePolicy": "best effort; refresh correctness wins",
+                        },
+                        user_id=reservation["user_id"],
+                        booking_id=reservation_id,
+                        payment_id=payment["id"],
+                        created_at=refreshed_at,
+                    )
+                elif normalized_payment_status == "voided":
+                    connection.execute("UPDATE payment_records SET status = 'voided' WHERE id = ?", (payment["id"],))
+                    connection.execute("UPDATE reservations SET status = 'failed', expires_at = NULL WHERE id = ?", (reservation_id,))
+                    payment_status = "voided"
+                    state_changed = True
+                    payment_step["action"] = "failed"
+                    record_audit_event(
+                        connection,
+                        actor=system_actor("refresh-status"),
+                        event_type="payment.failed",
+                        entity_type="payment",
+                        entity_id=payment["id"],
+                        metadata={
+                            "reservationId": reservation_id,
+                            "provider": payment["provider"],
+                            "previousStatus": payment["status"],
+                            "status": "voided",
+                            "source": "refresh-status",
+                            "auditWritePolicy": "best effort; refresh correctness wins",
+                        },
+                        user_id=reservation["user_id"],
+                        booking_id=reservation_id,
+                        payment_id=payment["id"],
+                        created_at=refreshed_at,
+                    )
+                elif external_payment_status is not None:
+                    payment_step["action"] = "unknown_retryable"
+                refresh_steps.append(payment_step)
+
+            reservation = _reservation_by_id(connection, reservation_id)
+            if provider_order is not None and provider_status in PROVIDER_REFRESHABLE_STATUSES and reservation["status"] in REFRESHABLE_RESERVATION_STATUSES:
+                external_provider_status = None
+                provider_step = {"source": "provider", "previousStatus": provider_status, "externalStatus": None, "action": "unchanged"}
+                if flight_provider is not None:
+                    try:
+                        external_provider_status = FlightBookingService(flight_provider).getOrderStatus(provider_order["provider_reference"]).status
+                    except FlightProviderError:
+                        external_provider_status = None
+                provider_step["externalStatus"] = external_provider_status
+                normalized_provider_status = _normalize_provider_refresh_status(external_provider_status)
+                if normalized_provider_status == "ticketed":
+                    connection.execute("UPDATE provider_orders SET status = 'ticketed', updated_at = ? WHERE id = ?", (refreshed_at, provider_order["id"]))
+                    provider_status = "ticketed"
+                    state_changed = True
+                    provider_step["action"] = "ticketed"
+                    record_audit_event(
+                        connection,
+                        actor=system_actor("refresh-status"),
+                        event_type="provider_order.ticketed",
+                        entity_type="booking",
+                        entity_id=reservation_id,
+                        metadata={
+                            "providerOrderId": provider_order["id"],
+                            "provider": provider_order["provider"],
+                            "previousStatus": provider_order["status"],
+                            "status": "ticketed",
+                            "source": "refresh-status",
+                            "auditWritePolicy": "best effort; refresh correctness wins",
+                        },
+                        user_id=reservation["user_id"],
+                        booking_id=reservation_id,
+                        offer_id=provider_order["offer_id"],
+                        created_at=refreshed_at,
+                    )
+                elif normalized_provider_status == "failed":
+                    connection.execute("UPDATE provider_orders SET status = 'failed', updated_at = ? WHERE id = ?", (refreshed_at, provider_order["id"]))
+                    connection.execute("UPDATE reservations SET status = 'failed', expires_at = NULL WHERE id = ?", (reservation_id,))
+                    provider_status = "failed"
+                    state_changed = True
+                    provider_step["action"] = "failed"
+                    record_audit_event(
+                        connection,
+                        actor=system_actor("refresh-status"),
+                        event_type="provider_order.failed",
+                        entity_type="booking",
+                        entity_id=reservation_id,
+                        metadata={
+                            "providerOrderId": provider_order["id"],
+                            "provider": provider_order["provider"],
+                            "previousStatus": provider_order["status"],
+                            "status": "failed",
+                            "source": "refresh-status",
+                            "auditWritePolicy": "best effort; refresh correctness wins",
+                        },
+                        user_id=reservation["user_id"],
+                        booking_id=reservation_id,
+                        offer_id=provider_order["offer_id"],
+                        created_at=refreshed_at,
+                    )
+                elif external_provider_status is not None:
+                    provider_step["action"] = "unknown_retryable"
+                refresh_steps.append(provider_step)
+
+            reservation = _reservation_by_id(connection, reservation_id)
+            if reservation["status"] in REFRESHABLE_RESERVATION_STATUSES:
+                final_status = _reservation_status_from_parts(payment_status, provider_status)
+                if final_status != reservation["status"]:
+                    connection.execute(
+                        "UPDATE reservations SET status = ?, expires_at = CASE WHEN ? IN ('confirmed', 'failed') THEN NULL ELSE expires_at END WHERE id = ?",
+                        (final_status, final_status, reservation_id),
+                    )
+                    state_changed = True
+                    record_audit_event(
+                        connection,
+                        actor=system_actor("refresh-status"),
+                        event_type=f"reservation.{final_status}",
+                        entity_type="reservation",
+                        entity_id=reservation_id,
+                        metadata={
+                            "previousStatus": reservation["status"],
+                            "status": final_status,
+                            "paymentStatus": payment_status,
+                            "providerStatus": provider_status,
+                            "source": "refresh-status",
+                            "auditWritePolicy": "best effort; refresh correctness wins",
+                        },
+                        user_id=reservation["user_id"],
+                        booking_id=reservation_id,
+                        payment_id=payment["id"] if payment is not None else None,
+                        created_at=refreshed_at,
+                    )
+
+            connection.commit()
+            reservation = _reservation_by_id(connection, reservation_id)
+            payment = _latest_payment(connection, reservation_id)
+            provider_order = _latest_provider_order(connection, reservation_id)
+            return _refresh_payload(reservation, payment, provider_order, changed=state_changed, terminal=original_status in TERMINAL_RESERVATION_STATUSES, steps=refresh_steps)
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
 
 
 def get_reservation_for_user(database_path: str, reservation_id: str, user_id: str) -> dict[str, Any]:
@@ -939,6 +1134,36 @@ def booking_api_record_payment(database_path: str, payload: dict[str, Any], user
         return success_response({"duplicate": result["duplicate"], "payment": payment_safe_dto(payment)}, status_code=200 if result["duplicate"] else 201)
 
 
+def booking_api_refresh_reservation_status(
+    database_path: str,
+    reservation_id: str,
+    user_id: str,
+    *,
+    payment_status_provider: Callable[[sqlite3.Row], str | None] | None = None,
+    flight_provider: FlightProvider | None = None,
+) -> ApiResponse:
+    """HTTP-shaped POST /bookings/:id/refresh-status adapter for pending confirmations."""
+
+    with _connect(database_path) as connection:
+        reservation = _reservation_by_id(connection, reservation_id)
+        actor = _actor_by_id(connection, user_id)
+        if reservation is None:
+            return error_response(404, "not_found", "Reservation not found.")
+        if not canViewReservation(actor, reservation) or actor is None or actor["role"] == "admin":
+            return error_response(403, "forbidden", "You are not authorized to refresh this reservation.")
+    try:
+        return success_response(
+            refresh_reservation_status(
+                database_path,
+                reservation_id=reservation_id,
+                payment_status_provider=payment_status_provider,
+                flight_provider=flight_provider,
+            )
+        )
+    except LookupError as exc:
+        return error_response(404, "not_found", str(exc))
+
+
 def booking_api_admin_get_reservation(database_path: str, reservation_id: str, user_id: str) -> ApiResponse:
     """HTTP-shaped admin reservation endpoint guarded by hotel administration auth."""
 
@@ -1055,6 +1280,106 @@ def _cancel_reservation_in_transaction(
         created_at=cancelled_at,
     )
     return connection.execute("SELECT * FROM reservations WHERE id = ?", (row["id"],)).fetchone(), refund_payload, False
+
+
+def _latest_payment(connection: sqlite3.Connection, reservation_id: str) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT * FROM payment_records
+        WHERE reservation_id = ?
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        (reservation_id,),
+    ).fetchone()
+
+
+def _latest_provider_order(connection: sqlite3.Connection, reservation_id: str) -> sqlite3.Row | None:
+    try:
+        return connection.execute(
+            """
+            SELECT * FROM provider_orders
+            WHERE reservation_id = ?
+            ORDER BY updated_at DESC, created_at DESC
+            LIMIT 1
+            """,
+            (reservation_id,),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+
+
+def _normalize_payment_refresh_status(status: str | None) -> str | None:
+    if status is None:
+        return None
+    normalized = status.lower()
+    if normalized in {"captured", "succeeded", "success", "paid", "confirmed"}:
+        return "captured"
+    if normalized in {"voided", "failed", "declined", "cancelled", "canceled"}:
+        return "voided"
+    if normalized in {"authorized", "pending", "processing", "requires_capture"}:
+        return "authorized"
+    return None
+
+
+def _normalize_provider_refresh_status(status: str | None) -> str | None:
+    if status is None:
+        return None
+    normalized = status.lower()
+    if normalized in {"ticketed", "confirmed", "fulfilled"}:
+        return "ticketed"
+    if normalized in {"failed", "cancelled", "canceled", "rejected"}:
+        return "failed"
+    if normalized in {"ticketing_pending", "pending", "processing"}:
+        return "ticketing_pending"
+    return None
+
+
+def _reservation_status_from_parts(payment_status: str | None, provider_status: str | None) -> str:
+    if payment_status == "voided" or provider_status == "failed":
+        return "failed"
+    if provider_status is None:
+        return "confirmed" if payment_status == "captured" else "pending_payment"
+    if payment_status == "captured" and provider_status == "ticketed":
+        return "confirmed"
+    if payment_status == "captured":
+        return "pending_provider"
+    return "pending_payment"
+
+
+def _provider_order_payload(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    return {
+        "id": row["id"],
+        "reservationId": row["reservation_id"],
+        "provider": row["provider"],
+        "offerId": row["offer_id"],
+        "amount": format_money(row["amount_cents"], row["currency"]),
+        "status": row["status"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def _refresh_payload(
+    reservation: sqlite3.Row,
+    payment: sqlite3.Row | None,
+    provider_order: sqlite3.Row | None,
+    *,
+    changed: bool,
+    terminal: bool,
+    steps: list[dict[str, Any]],
+) -> dict[str, Any]:
+    return {
+        "reservation": guest_reservation_dto(reservation),
+        "payment": payment_safe_dto(payment) if payment is not None else None,
+        "providerOrder": _provider_order_payload(provider_order),
+        "changed": changed,
+        "terminal": terminal,
+        "retryable": reservation["status"] in REFRESHABLE_RESERVATION_STATUSES,
+        "steps": steps,
+    }
 
 
 def _latest_refundable_payment(connection: sqlite3.Connection, reservation_id: str) -> sqlite3.Row | None:

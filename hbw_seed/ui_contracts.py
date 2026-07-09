@@ -132,7 +132,7 @@ _REQUIRED_STATES_BY_PAGE: dict[str, tuple[str, ...]] = {
     "hotel_detail": ("loading", "empty", "validation_error", "error", "not_found", "success", "retry"),
     "booking_guest_details": ("loading", "validation_error", "conflict", "error", "success", "retry"),
     "payment": ("loading", "validation_error", "payment_failure", "error", "success", "retry"),
-    "reservation_confirmation": ("loading", "not_found", "forbidden", "error", "success", "retry"),
+    "reservation_confirmation": ("loading", "pending", "not_found", "forbidden", "error", "success", "retry"),
     "account_reservations": ("loading", "empty", "not_found", "forbidden", "error", "success", "retry"),
     "cancellation": ("loading", "validation_error", "conflict", "not_found", "forbidden", "error", "success", "retry"),
     "admin_hotels": ("loading", "empty", "validation_error", "forbidden", "error", "success", "retry"),
@@ -423,6 +423,14 @@ def _state_for(page_key: str, status: str) -> PageStateContract:
         return PageStateContract(page_key, status, "Access is not allowed", "Sign in with an account that has permission, or return to your reservations.", role="alert", actions=({"label": "Go to my reservations", "href": "/account/reservations", "variant": "primary"},))
     if status == "error":
         return PageStateContract(page_key, status, "Something went wrong", "The request did not complete. Your data has not been confirmed unless a success message is shown.", role="alert", actions=common_actions)
+    if status == "pending":
+        return PageStateContract(
+            page_key,
+            status,
+            "Confirmation is still pending",
+            "Payment or provider confirmation is still processing. The page may poll POST /bookings/:id/refresh-status, and the Refresh status button can be used safely without creating another booking.",
+            actions=({"label": "Refresh status", "href": "/bookings/:id/refresh-status", "variant": "primary", "method": "POST"},),
+        )
     if status == "retry":
         return PageStateContract(page_key, status, "Retry is available", "You can retry the action without losing the information already entered.", actions=common_actions)
     if status == "success":
