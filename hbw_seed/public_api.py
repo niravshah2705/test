@@ -16,6 +16,7 @@ from math import ceil
 from typing import Any
 from urllib.parse import parse_qs
 
+from .audit import record_audit_event, system_actor
 from .dto import public_hotel_detail_dto, public_hotel_summary_dto, public_room_type_dto
 
 MAX_PAGE_SIZE = 50
@@ -93,6 +94,7 @@ def search_hotels(database_path: str, query: dict[str, str]) -> ApiResponse:
     page = validation["page"]
     page_size = validation["page_size"]
 
+    search_id = f"search_{re.sub(r'[^a-z0-9]+', '_', destination.lower()).strip('_')}_{check_in}_{check_out}_{guests}"
     with _connect(database_path) as connection:
         candidates = connection.execute(
             """
@@ -121,6 +123,26 @@ def search_hotels(database_path: str, query: dict[str, str]) -> ApiResponse:
                     available_room_types=len(room_types),
                 )
             )
+
+        record_audit_event(
+            connection,
+            actor=system_actor(),
+            event_type="search.performed",
+            entity_type="search",
+            entity_id=search_id,
+            metadata={
+                "destination": destination,
+                "checkIn": check_in,
+                "checkOut": check_out,
+                "adults": validation["adults"],
+                "children": validation["children"],
+                "resultCount": len(matching_hotels),
+                "auditWritePolicy": "best effort; search correctness wins",
+            },
+            created_at="2031-04-01T09:00:00Z",
+            search_id=search_id,
+        )
+        connection.commit()
 
     total = len(matching_hotels)
     start = (page - 1) * page_size

@@ -202,6 +202,7 @@ def create_pending_reservation(
                 entity_type="reservation",
                 entity_id=reservation_id,
                 metadata={
+                    "userId": user_id,
                     "hotelId": hotel_id,
                     "roomTypeId": room_type_id,
                     "roomId": room_ids[0],
@@ -210,6 +211,8 @@ def create_pending_reservation(
                     "currency": room_type["currency"],
                     "auditWritePolicy": "best effort; reservation correctness wins",
                 },
+                user_id=user_id,
+                booking_id=reservation_id,
                 created_at=created_at,
             )
             connection.commit()
@@ -286,6 +289,8 @@ def record_payment_webhook(
                     "failureReason": "amount_or_currency_mismatch",
                     "auditWritePolicy": "best effort; payment correctness wins",
                 },
+                booking_id=reservation_id,
+                payment_id=f"pay_{provider_reference}",
                 created_at=created_at,
             )
             connection.commit()
@@ -319,6 +324,9 @@ def record_payment_webhook(
                 entity_type="reservation",
                 entity_id=reservation_id,
                 metadata={"paymentId": f"pay_{provider_reference}", "auditWritePolicy": "best effort; payment correctness wins"},
+                user_id=reservation["user_id"],
+                booking_id=reservation_id,
+                payment_id=f"pay_{provider_reference}",
                 created_at=created_at,
             )
         record_audit_event(
@@ -335,6 +343,9 @@ def record_payment_webhook(
                 "status": status,
                 "auditWritePolicy": "best effort; payment correctness wins",
             },
+            user_id=reservation["user_id"],
+            booking_id=reservation_id,
+            payment_id=f"pay_{provider_reference}",
             created_at=created_at,
         )
         connection.commit()
@@ -571,6 +582,8 @@ def admin_update_reservation_status(
                     entity_type="reservation",
                     entity_id=reservation_id,
                     metadata={"auditWritePolicy": "blocking for admin reservation status mutations"},
+                    user_id=row["user_id"],
+                    booking_id=reservation_id,
                     created_at=updated_at,
                     block_on_failure=True,
                 )
@@ -632,6 +645,9 @@ def create_payment_intent(
                     "currency": reservation["currency"],
                     "auditWritePolicy": "best effort; payment correctness wins",
                 },
+                user_id=reservation["user_id"],
+                booking_id=reservation_id,
+                payment_id=payment_id,
                 created_at=created_at,
             )
             connection.commit()
@@ -1034,6 +1050,8 @@ def _cancel_reservation_in_transaction(
         entity_type="reservation",
         entity_id=row["id"],
         metadata={"refundId": refund_payload["id"] if refund_payload else None, "auditWritePolicy": "best effort; cancellation correctness wins"},
+        user_id=row["user_id"],
+        booking_id=row["id"],
         created_at=cancelled_at,
     )
     return connection.execute("SELECT * FROM reservations WHERE id = ?", (row["id"],)).fetchone(), refund_payload, False
@@ -1100,6 +1118,9 @@ def _create_refund_in_transaction(
             "provider": payment["provider"],
             "auditWritePolicy": "best effort; cancellation correctness wins",
         },
+        user_id=actor["id"],
+        booking_id=payment["reservation_id"],
+        payment_id=payment["id"],
         created_at=created_at,
     )
     return {"id": refund_id, "amount": format_money(amount_cents, payment["currency"]), "status": provider_result["status"]}, False
