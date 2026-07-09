@@ -14,6 +14,8 @@ from hbw_seed.booking import (
     admin_update_room_type,
     available_room_ids,
     booking_api_cancel_reservation,
+    booking_api_confirm_payment_token,
+    booking_api_create_payment_session,
     booking_api_create_reservation,
     booking_api_admin_cancel_reservation,
     booking_api_admin_get_reservation,
@@ -26,6 +28,7 @@ from hbw_seed.booking import (
     calculate_total_cents,
     create_payment_intent,
     cancel_reservation,
+    confirm_tokenized_payment,
     create_pending_reservation,
     expire_pending_reservation,
     format_money,
@@ -33,6 +36,15 @@ from hbw_seed.booking import (
     parse_stay_dates,
     record_payment_webhook,
     validate_occupancy,
+)
+from hbw_seed.payments import (
+    DeterministicMockPaymentProvider,
+    PaymentConfirmationRequest,
+    PaymentProvider,
+    PaymentProviderConflict,
+    PaymentProviderTimeout,
+    PaymentSessionRequest,
+    internal_status_for_provider_outcome,
 )
 from hbw_seed.public_api import handle_get
 
@@ -579,6 +591,142 @@ def test_guest_confirmation_lookup_requires_non_guessable_secret(tmp_path):
     assert valid.body["data"]["id"] == "res_bay_king_guest_confirmed"
     assert "roomId" not in valid.body["data"]
     assert "userId" not in valid.body["data"]
+
+
+def test_payment_provider_interface_uses_tokenized_contract_without_raw_card_fields():
+    required = ["createPaymentSession", "confirmPaymentToken", "capturePayment", "cancelPayment", "getPaymentStatus"]
+
+    for operation in required:
+        assert hasattr(PaymentProvider, operation)
+        assert hasattr(DeterministicMockPaymentProvider, operation)
+
+    import inspect
+
+    combined = "\n".join(
+        [
+            inspect.getsource(PaymentProvider),
+            inspect.getsource(PaymentSessionRequest),
+            inspect.getsource(PaymentConfirmationRequest),
+            inspect.getsource(booking_api_create_payment_session),
+            inspect.getsource(booking_api_confirm_payment_token),
+        ]
+    ).lower()
+    forbidden = ["card_number", "cardnumber", "cvv", "cvc", "pan", "expiry_month", "expirymonth", "raw_card"]
+    for field in forbidden:
+        assert field not in combined
+    assert "payment_token" in combined
+
+
+def test_mock_payment_provider_scenarios_duplicate_timeout_reuse_and_capture_failure():
+    provider = DeterministicMockPaymentProvider()
+    session = provider.createPaymentSession(PaymentSessionRequest("res_mock", 12345, idempotency_key="sess-1"))
+    duplicate_session = provider.createPaymentSession(PaymentSessionRequest("res_mock", 12345, idempotency_key="sess-1"))
+    assert duplicate_session is session
+    assert session.to_client_payload()["clientInitialization"]["mode"] == "hosted_or_tokenized_component"
+    assert "providerSecret" not in session.to_client_payload()["clientInitialization"]
+
+    authorized = provider.confirmPaymentToken(PaymentConfirmationRequest(session.id, "tok_success_123456", 12345, idempotency_key="confirm-1"))
+    duplicate = provider.confirmPaymentToken(PaymentConfirmationRequest(session.id, "tok_success_123456", 12345, idempotency_key="confirm-1"))
+    declined = provider.confirmPaymentToken(PaymentConfirmationRequest(session.id, "tok_declined_123456", 12345, scenario="declined"))
+    delayed = provider.confirmPaymentToken(PaymentConfirmationRequest(session.id, "tok_delayed_123456", 12345, scenario="delayed_confirmation"))
+    mismatch = provider.confirmPaymentToken(PaymentConfirmationRequest(session.id, "tok_mismatch_123456", 99999))
+    expired_session = provider.createPaymentSession(PaymentSessionRequest("res_expired", 12345, scenario="expired_session"))
+    expired = provider.confirmPaymentToken(PaymentConfirmationRequest(expired_session.id, "tok_expired_123456", 12345))
+    capture_failure = provider.capturePayment(authorized.provider_reference, amount_cents=12345, scenario="capture_failure")
+
+    assert authorized.status == "authorized"
+    assert duplicate.duplicate is True
+    assert declined.status == "declined"
+    assert delayed.status == "pending"
+    assert mismatch.status == "failed"
+    assert expired.status == "expired"
+    assert capture_failure.status == "failed"
+    assert_raises(PaymentProviderConflict, provider.confirmPaymentToken, PaymentConfirmationRequest(session.id, "tok_declined_123456", 12345))
+    assert_raises(PaymentProviderTimeout, provider.createPaymentSession, PaymentSessionRequest("res_timeout", 12345, scenario="timeout"))
+    assert_raises(PaymentProviderTimeout, provider.confirmPaymentToken, PaymentConfirmationRequest(session.id, "tok_timeout_123456", 12345, scenario="timeout"))
+
+
+def test_tokenized_payment_application_service_maps_and_persists_safe_references(tmp_path):
+    database = seeded_database(tmp_path)
+    provider = DeterministicMockPaymentProvider()
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_tokenized_payment",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+    session = booking_api_create_payment_session(str(database), {"reservationId": reservation["id"], "idempotencyKey": "sess-tokenized"}, "usr_guest", provider=provider)
+    confirmed = booking_api_confirm_payment_token(
+        str(database),
+        {"reservationId": reservation["id"], "sessionId": session.body["data"]["id"], "paymentToken": "tok_hosted_success_123456", "idempotencyKey": "confirm-tokenized"},
+        "usr_guest",
+        provider=provider,
+    )
+    duplicate = booking_api_confirm_payment_token(
+        str(database),
+        {"reservationId": reservation["id"], "sessionId": session.body["data"]["id"], "paymentToken": "tok_hosted_success_123456", "idempotencyKey": "confirm-tokenized"},
+        "usr_guest",
+        provider=provider,
+    )
+
+    assert session.status_code == 201
+    assert confirmed.status_code == 201
+    assert duplicate.status_code == 200
+    assert duplicate.body["data"]["duplicate"] is True
+    assert confirmed.body["data"]["payment"]["status"] == "captured"
+    assert confirmed.body["data"]["providerStatus"] == "captured"
+    serialized = json.dumps(session.body) + json.dumps(confirmed.body)
+    for forbidden in ["cardNumber", "cvv", "cvc", "providerSecret", "providerReference"]:
+        assert forbidden not in serialized
+    with sqlite3.connect(database) as connection:
+        reservation_status = connection.execute("SELECT status FROM reservations WHERE id = ?", (reservation["id"],)).fetchone()[0]
+        provider, provider_reference, status = connection.execute(
+            "SELECT provider, provider_reference, status FROM payment_records WHERE reservation_id = ?",
+            (reservation["id"],),
+        ).fetchone()
+        audit_metadata_payload = connection.execute("SELECT metadata FROM audit_events WHERE event_type = 'payment.confirmed' ORDER BY created_at DESC LIMIT 1").fetchone()[0]
+    audit_metadata = json.loads(audit_metadata_payload)
+    assert reservation_status == "confirmed"
+    assert provider == "deterministic_mock_payments"
+    assert provider_reference.startswith("auth_ps_res_tokenized_payment_success_")
+    assert status == "captured"
+    assert set(audit_metadata["safeMetadata"]) >= {"sessionId", "tokenized", "paymentComponent"}
+    assert "paymentToken" not in audit_metadata_payload
+    assert "tok_hosted_success" not in audit_metadata_payload
+
+
+def test_tokenized_payment_amount_mismatch_and_provider_timeout_are_safe(tmp_path):
+    database = seeded_database(tmp_path)
+    provider = DeterministicMockPaymentProvider()
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_payment_edge_cases",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+    session = provider.createPaymentSession(PaymentSessionRequest(reservation["id"], reservation["total"]["amountCents"]))
+    mismatch = provider.confirmPaymentToken(PaymentConfirmationRequest(session.id, "tok_amount_mismatch", reservation["total"]["amountCents"] - 100))
+    timeout = booking_api_create_payment_session(str(database), {"reservationId": reservation["id"], "scenario": "timeout"}, "usr_guest", provider=provider)
+
+    assert mismatch.status == "failed"
+    assert mismatch.safe_metadata["failureReason"] == "amount_or_currency_mismatch"
+    assert internal_status_for_provider_outcome(mismatch.status) == "voided"
+    assert timeout.status_code == 504
+    assert timeout.body["error"]["code"] == "provider_timeout"
 
 
 def test_payment_api_authorizes_owner_and_hides_provider_reference(tmp_path):
