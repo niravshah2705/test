@@ -17,6 +17,7 @@ from typing import Any
 
 from .audit import actor_from_user, record_audit_event, system_actor, user_actor
 from .auth import canAdministerHotel, canCancelReservation, canPayReservation, canViewReservation
+from .availability import available_physical_room_ids
 from .dto import admin_reservation_dto, guest_reservation_dto, payment_safe_dto
 from .public_api import ApiResponse, error_response, success_response
 
@@ -102,35 +103,14 @@ def available_room_ids(
     """Return active room IDs not blocked by closures, holds, or reservations."""
 
     parse_stay_dates(check_in, check_out)
-    rows = connection.execute(
-        """
-        SELECT room.id
-        FROM rooms AS room
-        WHERE room.room_type_id = ?
-          AND room.status = 'active'
-          AND NOT EXISTS (
-            SELECT 1 FROM availability_blocks AS block
-            WHERE block.hotel_id = ?
-              AND block.starts_on < ?
-              AND block.ends_on > ?
-              AND (
-                block.block_type = 'hotel_closure'
-                OR block.room_type_id = ?
-                OR block.room_id = room.id
-              )
-          )
-          AND NOT EXISTS (
-            SELECT 1 FROM reservations AS reservation
-            WHERE reservation.room_id = room.id
-              AND reservation.check_in < ?
-              AND reservation.check_out > ?
-              AND reservation.status IN ('confirmed', 'pending_payment')
-          )
-        ORDER BY room.id
-        """,
-        (room_type_id, hotel_id, check_out, check_in, room_type_id, check_out, check_in),
-    ).fetchall()
-    return [row[0] for row in rows]
+    room_ids, _reasons = available_physical_room_ids(
+        connection,
+        hotel_id=hotel_id,
+        room_type_id=room_type_id,
+        check_in=check_in,
+        check_out=check_out,
+    )
+    return room_ids
 
 
 def create_pending_reservation(
