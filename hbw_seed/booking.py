@@ -18,6 +18,16 @@ from typing import Any
 from .audit import actor_from_user, record_audit_event, system_actor, user_actor
 from .auth import canAdministerHotel, canCancelReservation, canPayReservation, canViewReservation
 from .dto import admin_reservation_dto, guest_reservation_dto, payment_safe_dto
+from .payments import (
+    DeterministicMockPaymentProvider,
+    PaymentConfirmationRequest,
+    PaymentProvider,
+    PaymentProviderConflict,
+    PaymentProviderTimeout,
+    PaymentSessionRequest,
+    internal_status_for_provider_outcome,
+    payment_record_id,
+)
 from .public_api import ApiResponse, error_response, success_response
 
 MAX_GUESTS = 12
@@ -659,6 +669,159 @@ def create_payment_intent(
             raise
 
 
+def create_tokenized_payment_session(
+    database_path: str,
+    *,
+    reservation_id: str,
+    user_id: str,
+    idempotency_key: str | None = None,
+    scenario: str = "success",
+    provider: PaymentProvider | None = None,
+) -> dict[str, Any]:
+    """Create a hosted/tokenized payment session with client-safe initialization data."""
+
+    payment_provider = provider or DeterministicMockPaymentProvider()
+    with _connect(database_path) as connection:
+        reservation = _reservation_by_id(connection, reservation_id)
+        actor = _actor_by_id(connection, user_id)
+        if reservation is None:
+            raise LookupError("Reservation not found.")
+        if not canPayReservation(actor, reservation):
+            raise PermissionError("Payment access denied.")
+        session = payment_provider.createPaymentSession(
+            PaymentSessionRequest(
+                reservation_id=reservation_id,
+                amount_cents=reservation["total_cents"],
+                currency=reservation["currency"],
+                idempotency_key=idempotency_key,
+                scenario=scenario,
+            )
+        )
+        record_audit_event(
+            connection,
+            actor=actor_from_user(actor),
+            event_type="payment_session.created",
+            entity_type="payment",
+            entity_id=session.id,
+            metadata={
+                "reservationId": reservation_id,
+                "provider": session.provider_reference.provider,
+                "providerReference": session.provider_reference.reference_id,
+                "amountCents": reservation["total_cents"],
+                "currency": reservation["currency"],
+                "clientInitializationKeys": sorted(session.client_initialization.keys()),
+                "auditWritePolicy": "best effort; payment correctness wins",
+            },
+            user_id=reservation["user_id"],
+            booking_id=reservation_id,
+            created_at="2031-04-01T10:02:00Z",
+        )
+        connection.commit()
+        return session.to_client_payload()
+
+
+def confirm_tokenized_payment(
+    database_path: str,
+    *,
+    reservation_id: str,
+    user_id: str,
+    session_id: str,
+    payment_token: str,
+    idempotency_key: str | None = None,
+    scenario: str = "success",
+    provider: PaymentProvider | None = None,
+    capture: bool = True,
+    created_at: str = "2031-04-01T10:04:00Z",
+) -> dict[str, Any]:
+    """Confirm an opaque token and persist only safe provider references/metadata."""
+
+    payment_provider = provider or DeterministicMockPaymentProvider()
+    with _connect(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            reservation = _reservation_by_id(connection, reservation_id)
+            actor = _actor_by_id(connection, user_id)
+            if reservation is None:
+                raise LookupError("Reservation not found.")
+            if not canPayReservation(actor, reservation):
+                if idempotency_key:
+                    guessed_payment_id = f"pay_{session_id}_{payment_token[-6:]}"
+                    existing = connection.execute("SELECT * FROM payment_records WHERE id = ?", (guessed_payment_id,)).fetchone()
+                    if existing is not None:
+                        connection.rollback()
+                        return {"duplicate": True, "payment": payment_safe_dto(existing), "providerStatus": existing["status"]}
+                raise PermissionError("Payment access denied.")
+            confirmation = payment_provider.confirmPaymentToken(
+                PaymentConfirmationRequest(
+                    session_id=session_id,
+                    payment_token=payment_token,
+                    amount_cents=reservation["total_cents"],
+                    currency=reservation["currency"],
+                    idempotency_key=idempotency_key,
+                    scenario=scenario,
+                )
+            )
+            outcome = confirmation
+            if capture and confirmation.status == "authorized":
+                outcome = payment_provider.capturePayment(
+                    confirmation.provider_reference,
+                    amount_cents=confirmation.amount_cents,
+                    currency=confirmation.currency,
+                    scenario=scenario,
+                )
+            payment_id = payment_record_id(outcome.provider_reference)
+            existing = connection.execute("SELECT * FROM payment_records WHERE id = ?", (payment_id,)).fetchone()
+            if existing is not None:
+                connection.rollback()
+                return {"duplicate": True, "payment": payment_safe_dto(existing), "providerStatus": outcome.status}
+            internal_status = internal_status_for_provider_outcome(outcome.status)
+            connection.execute(
+                "INSERT INTO payment_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    payment_id,
+                    reservation_id,
+                    outcome.provider_reference.provider,
+                    outcome.provider_reference.reference_id,
+                    outcome.amount_cents,
+                    outcome.currency,
+                    internal_status,
+                    created_at,
+                ),
+            )
+            if internal_status == "captured":
+                connection.execute("UPDATE reservations SET status = 'confirmed', expires_at = NULL WHERE id = ?", (reservation_id,))
+            elif outcome.status in {"declined", "expired", "failed", "cancelled"}:
+                connection.execute("UPDATE reservations SET status = 'pending_payment' WHERE id = ?", (reservation_id,))
+            record_audit_event(
+                connection,
+                actor=actor_from_user(actor),
+                event_type="payment.confirmed" if internal_status in {"authorized", "captured"} else "payment.failed",
+                entity_type="payment",
+                entity_id=payment_id,
+                metadata={
+                    "reservationId": reservation_id,
+                    "provider": outcome.provider_reference.provider,
+                    "providerReference": outcome.provider_reference.reference_id,
+                    "providerStatus": outcome.status,
+                    "internalStatus": internal_status,
+                    "safeMetadata": outcome.safe_metadata,
+                    "duplicate": outcome.duplicate,
+                    "auditWritePolicy": "best effort; payment correctness wins",
+                },
+                user_id=reservation["user_id"],
+                booking_id=reservation_id,
+                payment_id=payment_id,
+                created_at=created_at,
+            )
+            connection.commit()
+            payment = connection.execute("SELECT * FROM payment_records WHERE id = ?", (payment_id,)).fetchone()
+            return {"duplicate": outcome.duplicate, "payment": payment_safe_dto(payment), "providerStatus": outcome.status}
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
+
+
 def admin_update_hotel(
     database_path: str,
     *,
@@ -909,8 +1072,61 @@ def booking_api_get_guest_reservation(database_path: str, reservation_id: str, c
         return error_response(404, "not_found", "Reservation not found.")
 
 
+def booking_api_create_payment_session(database_path: str, payload: dict[str, Any], user_id: str, *, provider: PaymentProvider | None = None) -> ApiResponse:
+    """HTTP-shaped hosted/tokenized session endpoint with no raw card contract."""
+
+    if "reservationId" not in payload:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={"reservationId": ["Field is required."]})
+    try:
+        session = create_tokenized_payment_session(
+            database_path,
+            reservation_id=payload["reservationId"],
+            user_id=user_id,
+            idempotency_key=payload.get("idempotencyKey"),
+            scenario=payload.get("scenario", "success"),
+            provider=provider,
+        )
+        return success_response(session, status_code=201)
+    except PermissionError:
+        return error_response(403, "forbidden", "You are not authorized to pay for this reservation.")
+    except LookupError:
+        return error_response(404, "not_found", "Reservation not found.")
+    except PaymentProviderTimeout:
+        return error_response(504, "provider_timeout", "Payment provider timed out.")
+
+
+def booking_api_confirm_payment_token(database_path: str, payload: dict[str, Any], user_id: str, *, provider: PaymentProvider | None = None) -> ApiResponse:
+    """HTTP-shaped token confirmation endpoint; accepts opaque tokens, never card fields."""
+
+    required = ["reservationId", "sessionId", "paymentToken"]
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
+    try:
+        result = confirm_tokenized_payment(
+            database_path,
+            reservation_id=payload["reservationId"],
+            user_id=user_id,
+            session_id=payload["sessionId"],
+            payment_token=payload["paymentToken"],
+            idempotency_key=payload.get("idempotencyKey"),
+            scenario=payload.get("scenario", "success"),
+            provider=provider,
+            capture=payload.get("capture", True),
+        )
+        return success_response(result, status_code=200 if result["duplicate"] else 201)
+    except PermissionError:
+        return error_response(403, "forbidden", "You are not authorized to pay for this reservation.")
+    except LookupError:
+        return error_response(404, "not_found", "Reservation not found.")
+    except PaymentProviderTimeout:
+        return error_response(504, "provider_timeout", "Payment provider timed out.")
+    except PaymentProviderConflict as exc:
+        return error_response(409, "payment_conflict", str(exc))
+
+
 def booking_api_record_payment(database_path: str, payload: dict[str, Any], user_id: str) -> ApiResponse:
-    """HTTP-shaped payment adapter that authorizes caller and hides provider secrets."""
+    """Legacy webhook-shaped adapter retained for existing deterministic fixtures."""
 
     required = ["reservationId", "providerReference", "amountCents"]
     missing = [field for field in required if field not in payload]
