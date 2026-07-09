@@ -4,6 +4,7 @@ import sqlite3
 from hbw_seed import reset_and_seed
 from hbw_seed.auth import canAdministerHotel, canCancelReservation, canViewReservation
 from hbw_seed.audit import record_audit_event, sanitize_metadata, system_actor
+from hbw_seed.availability import AvailabilityValidationError, calculate_room_type_availability
 from hbw_seed.booking import (
     BookingConflict,
     BookingValidationError,
@@ -248,6 +249,7 @@ def test_integration_availability_supports_back_to_back_and_filters_overlaps(tmp
     database = seeded_database(tmp_path)
 
     with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
         assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-10", "2031-06-12") == ["room_garden_family_302"]
         assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-12", "2031-06-14") == [
             "room_garden_family_301",
@@ -258,6 +260,116 @@ def test_integration_availability_supports_back_to_back_and_filters_overlaps(tmp
             "room_bay_king_501",
             "room_bay_king_502",
         ]
+
+
+def test_availability_engine_returns_prices_capacity_remaining_and_reasons(tmp_path):
+    database = seeded_database(tmp_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        availability = calculate_room_type_availability(
+            connection,
+            hotel_id="htl_sfo_bay",
+            check_in="2031-06-10",
+            check_out="2031-06-12",
+            adults=2,
+            children=0,
+            include_unavailable=True,
+        )
+
+    by_code = {room_type["code"]: room_type for room_type in availability["roomTypes"]}
+    assert availability["nights"] == 2
+    assert availability["available"] is False
+    assert by_code["rt_bay_king"]["activeInventory"] == 2
+    assert by_code["rt_bay_king"]["remainingQuantity"] == 0
+    assert by_code["rt_bay_king"]["nightlyRate"] == {"amountCents": 24000, "currency": "USD", "formatted": "USD 240.00"}
+    assert by_code["rt_bay_king"]["totalPreTax"] == {"amountCents": 48000, "currency": "USD", "formatted": "USD 480.00"}
+    assert by_code["rt_bay_king"]["occupancy"]["compatible"] is True
+    assert by_code["rt_bay_king"]["unavailableReasons"] == ["reserved", "sold_out"]
+    assert by_code["rt_bay_suite"]["remainingQuantity"] == 0
+    assert by_code["rt_bay_suite"]["unavailableReasons"] == ["room_block", "reserved", "sold_out"]
+
+
+def test_availability_engine_handles_blocks_pending_cancelled_expired_and_room_type_filter(tmp_path):
+    database = seeded_database(tmp_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        pending_hold = calculate_room_type_availability(
+            connection,
+            hotel_id="htl_sfo_garden",
+            room_type_id="rt_garden_family",
+            check_in="2031-06-10",
+            check_out="2031-06-12",
+            adults=2,
+            children=1,
+        )["roomTypes"][0]
+        room_type_block = calculate_room_type_availability(
+            connection,
+            hotel_id="htl_sfo_garden",
+            room_type_id="rt_garden_queen",
+            check_in="2031-06-10",
+            check_out="2031-06-12",
+            adults=2,
+            children=0,
+        )["roomTypes"][0]
+        hotel_block = calculate_room_type_availability(
+            connection,
+            hotel_id="htl_nyc_loft",
+            check_in="2031-06-10",
+            check_out="2031-06-12",
+            adults=2,
+            children=0,
+        )
+        back_to_back = calculate_room_type_availability(
+            connection,
+            hotel_id="htl_sfo_garden",
+            room_type_id="rt_garden_family",
+            check_in="2031-06-12",
+            check_out="2031-06-14",
+            adults=2,
+            children=1,
+        )["roomTypes"][0]
+
+    assert pending_hold["activeInventory"] == 2
+    assert pending_hold["remainingQuantity"] == 1
+    assert pending_hold["unavailableReasons"] == ["reserved"]
+    assert room_type_block["remainingQuantity"] == 0
+    assert room_type_block["unavailableReasons"] == ["room_type_block", "sold_out"]
+    assert {room_type["code"]: room_type["unavailableReasons"] for room_type in hotel_block["roomTypes"]} == {
+        "rt_loft_queen": ["hotel_block", "sold_out"],
+        "rt_loft_double": ["hotel_block", "sold_out"],
+    }
+    assert back_to_back["remainingQuantity"] == 2
+    assert back_to_back["unavailableReasons"] == []
+
+
+def test_availability_engine_occupancy_exceeded_and_invalid_ranges(tmp_path):
+    database = seeded_database(tmp_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        incompatible = calculate_room_type_availability(
+            connection,
+            hotel_id="htl_sfo_garden",
+            room_type_id="rt_garden_queen",
+            check_in="2031-06-12",
+            check_out="2031-06-14",
+            adults=2,
+            children=1,
+        )["roomTypes"][0]
+
+    assert incompatible["occupancy"] == {
+        "adults": 2,
+        "children": 1,
+        "totalGuests": 3,
+        "capacity": 2,
+        "compatible": False,
+    }
+    assert incompatible["remainingQuantity"] == 0
+    assert incompatible["unavailableReasons"] == ["occupancy_exceeded"]
+    assert str(assert_raises(AvailabilityValidationError, calculate_room_type_availability, sqlite3.connect(database), hotel_id="htl_sfo_garden", check_in="2031-06-12", check_out="2031-06-12", adults=1, children=0)) == "check_out must be after check_in."
+    assert str(assert_raises(AvailabilityValidationError, calculate_room_type_availability, sqlite3.connect(database), hotel_id="htl_sfo_garden", check_in="2031-06-12", check_out="2031-06-13", adults=0, children=0)) == "At least one adult is required."
 
 
 def test_reservation_creation_is_transactional_for_last_room_and_duplicate_request(tmp_path):

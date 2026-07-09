@@ -16,6 +16,7 @@ from math import ceil
 from typing import Any
 from urllib.parse import parse_qs
 
+from .availability import calculate_room_type_availability
 from .dto import public_hotel_detail_dto, public_hotel_summary_dto, public_room_type_dto
 
 MAX_PAGE_SIZE = 50
@@ -186,7 +187,20 @@ def get_hotel_availability(database_path: str, slug: str, query: dict[str, str])
         hotel = _active_hotel_by_slug(connection, slug)
         if hotel is None:
             return _not_found()
-        room_types = _public_room_types(connection, hotel["id"], check_in, check_out, guests)
+        availability = calculate_room_type_availability(
+            connection,
+            hotel_id=hotel["id"],
+            check_in=check_in,
+            check_out=check_out,
+            adults=validation["adults"],
+            children=validation["children"],
+            room_type_id=(query.get("roomTypeId") or None),
+            include_unavailable=False,
+        )
+        room_types = [
+            _public_availability_room_type(connection, room_type)
+            for room_type in availability["roomTypes"]
+        ]
 
     data = {
         "hotelSlug": slug,
@@ -414,6 +428,24 @@ def _public_room_types(
             continue
         room_types.append(public_room_type_dto(row, images=_room_images(connection, row["id"]), available_rooms=available_rooms))
     return room_types
+
+
+def _public_availability_room_type(connection: sqlite3.Connection, room_type: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "code": room_type["code"],
+        "name": room_type["name"],
+        "capacity": room_type["capacity"],
+        "description": room_type["description"],
+        "price": room_type["price"],
+        "images": _room_images(connection, room_type["code"]),
+        "availableRooms": room_type["availableRooms"],
+        "remainingQuantity": room_type["remainingQuantity"],
+        "nightlyRate": room_type["nightlyRate"],
+        "totalPreTax": room_type["totalPreTax"],
+        "occupancy": room_type["occupancy"],
+        "unavailableReasons": room_type["unavailableReasons"],
+    }
+
 
 
 def _available_room_count(

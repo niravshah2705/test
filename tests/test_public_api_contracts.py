@@ -194,6 +194,11 @@ def test_get_hotel_availability_success_shape_and_hides_block_reasons(tmp_path):
                     }
                 ],
                 "availableRooms": 1,
+                "remainingQuantity": 1,
+                "nightlyRate": {"amountCents": 26000, "currency": "USD", "formatted": "USD 260.00"},
+                "totalPreTax": {"amountCents": 52000, "currency": "USD", "formatted": "USD 520.00"},
+                "occupancy": {"adults": 2, "children": 1, "totalGuests": 3, "capacity": 4, "compatible": True},
+                "unavailableReasons": ["reserved"],
             }
         ],
     }
