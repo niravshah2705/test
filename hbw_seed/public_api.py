@@ -81,6 +81,20 @@ def handle_get(database_path: str, path: str, query_string: str = "") -> ApiResp
     return error_response(404, "not_found", "Endpoint not found.")
 
 
+def handle_post(database_path: str, path: str, payload: dict[str, Any], user_id: str | None = None) -> ApiResponse:
+    """Dispatch framework-neutral POST endpoints for payment flows."""
+
+    from .booking import booking_api_confirm_payment, booking_api_create_payment_intent, booking_api_handle_provider_event
+
+    if path == "/api/payments/create-intent":
+        return booking_api_create_payment_intent(database_path, payload, user_id)
+    if path == "/api/payments/confirm":
+        return booking_api_confirm_payment(database_path, payload, user_id)
+    if path == "/api/payments/provider-events":
+        return booking_api_handle_provider_event(database_path, payload)
+    return error_response(404, "not_found", "Endpoint not found.")
+
+
 def search_hotels(database_path: str, query: dict[str, str]) -> ApiResponse:
     validation = _validate_search_query(query)
     if validation["errors"]:

@@ -112,7 +112,7 @@ def admin_reservation_dto(row: Mapping[str, Any]) -> dict[str, Any]:
 def payment_safe_dto(row: Mapping[str, Any]) -> dict[str, Any]:
     """Return payment status without provider references or method secrets."""
 
-    return {
+    payload = {
         "id": row["id"],
         "reservationId": row["reservation_id"],
         "provider": row["provider"],
@@ -120,3 +120,10 @@ def payment_safe_dto(row: Mapping[str, Any]) -> dict[str, Any]:
         "status": row["status"],
         "createdAt": row["created_at"],
     }
+    try:
+        failure_message = row["failure_message"]
+    except (KeyError, IndexError):
+        failure_message = None
+    if failure_message:
+        payload["failureMessage"] = failure_message
+    return payload
