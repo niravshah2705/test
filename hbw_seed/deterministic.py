@@ -29,6 +29,7 @@ SCHEMA_STATEMENTS = [
     "DROP VIEW IF EXISTS audit_records",
     "DROP TABLE IF EXISTS auth_sessions",
     "DROP TABLE IF EXISTS audit_events",
+    "DROP TABLE IF EXISTS notification_records",
     "DROP TABLE IF EXISTS refunds",
     "DROP TABLE IF EXISTS payment_records",
     "DROP TABLE IF EXISTS availability_blocks",
@@ -253,6 +254,20 @@ SCHEMA_STATEMENTS = [
         reason TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN ('succeeded', 'pending')),
         created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE notification_records (
+        id TEXT PRIMARY KEY,
+        booking_id TEXT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL CHECK (kind IN ('booking_confirmation', 'booking_failed', 'payment_failed', 'booking_pending')),
+        channel TEXT NOT NULL CHECK (channel IN ('email')),
+        recipient TEXT,
+        payload_json TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('queued', 'dispatched', 'skipped_missing_contact')),
+        created_at TEXT NOT NULL,
+        dispatched_at TEXT,
+        UNIQUE (booking_id, kind)
     )
     """,
     """
@@ -513,6 +528,7 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
             "availability_blocks",
             "payment_records",
             "refunds",
+            "notification_records",
             "audit_events",
         ]
         return {

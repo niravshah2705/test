@@ -34,6 +34,15 @@ from hbw_seed.booking import (
     record_payment_webhook,
     validate_occupancy,
 )
+from hbw_seed.notification import (
+    BOOKING_CONFIRMATION,
+    BOOKING_FAILED,
+    BOOKING_PENDING,
+    PAYMENT_FAILED,
+    InMemoryNotificationDispatcher,
+    create_booking_notification,
+    notification_rows,
+)
 from hbw_seed.public_api import handle_get
 
 
@@ -331,6 +340,142 @@ def test_expired_pending_reservation_releases_inventory(tmp_path):
         ]
         status = connection.execute("SELECT status FROM reservations WHERE id = 'res_garden_family_pending'").fetchone()[0]
     assert status == "expired"
+
+
+def test_notification_requests_cover_pending_confirmation_failure_missing_contact_and_sensitive_exclusions(tmp_path):
+    database = seeded_database(tmp_path)
+    dispatcher = InMemoryNotificationDispatcher()
+
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_notification_flow",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="notify@example.test",
+        guest_name="Nia Notify",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+        dispatcher=dispatcher,
+    )
+    assert [message.kind for message in dispatcher.messages] == [BOOKING_PENDING]
+
+    record_payment_webhook(
+        str(database),
+        provider_reference="fx_notification_success",
+        reservation_id=reservation["id"],
+        amount_cents=reservation["total"]["amountCents"],
+        dispatcher=dispatcher,
+    )
+    duplicate = record_payment_webhook(
+        str(database),
+        provider_reference="fx_notification_success",
+        reservation_id=reservation["id"],
+        amount_cents=reservation["total"]["amountCents"],
+        dispatcher=dispatcher,
+    )
+    assert duplicate["duplicate"] is True
+
+    payment_failure = create_pending_reservation(
+        str(database),
+        reservation_id="res_notification_payment_failed",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="payfail@example.test",
+        guest_name="Pia Payment",
+        check_in="2031-06-14",
+        check_out="2031-06-15",
+        adults=1,
+        children=0,
+        dispatcher=dispatcher,
+    )
+    assert_raises(
+        BookingValidationError,
+        record_payment_webhook,
+        str(database),
+        provider_reference="fx_notification_amount_mismatch",
+        reservation_id=payment_failure["id"],
+        amount_cents=payment_failure["total"]["amountCents"] - 1,
+        dispatcher=dispatcher,
+    )
+
+    missing_contact = create_pending_reservation(
+        str(database),
+        reservation_id="res_notification_missing_contact",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="missing-contact",
+        guest_name="Mina Missing",
+        check_in="2031-06-15",
+        check_out="2031-06-16",
+        adults=1,
+        children=0,
+        dispatcher=dispatcher,
+    )
+    failed = expire_pending_reservation(str(database), missing_contact["id"], now="2031-06-10T00:00:00Z", dispatcher=dispatcher)
+    assert failed is True
+
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = notification_rows(connection)
+
+    kinds_by_booking = {}
+    for row in rows:
+        kinds_by_booking.setdefault(row["bookingId"], []).append(row["kind"])
+        encoded = json.dumps(row["payload"])
+        assert "providerReference" not in encoded
+        assert "rawPayload" not in encoded
+        assert "cardNumber" not in encoded
+        assert "document" not in encoded.lower()
+        assert "confirmation_secret" not in encoded
+        assert row["payload"]["bookingReference"] == row["bookingId"]
+        assert row["payload"]["status"] in {"pending_payment", "confirmed", "expired"}
+        assert "hotelName" in row["payload"]["itinerarySummary"]
+
+    assert kinds_by_booking["res_notification_flow"].count(BOOKING_CONFIRMATION) == 1
+    assert kinds_by_booking["res_notification_flow"] == [BOOKING_PENDING, BOOKING_CONFIRMATION]
+    assert PAYMENT_FAILED in kinds_by_booking["res_notification_payment_failed"]
+    assert BOOKING_FAILED in kinds_by_booking["res_notification_missing_contact"]
+    missing_rows = [row for row in rows if row["bookingId"] == "res_notification_missing_contact"]
+    assert all(row["status"] == "skipped_missing_contact" for row in missing_rows)
+    dispatched_kinds = [message.kind for message in dispatcher.messages]
+    assert dispatched_kinds.count(BOOKING_CONFIRMATION) == 1
+    assert BOOKING_FAILED not in [message.kind for message in dispatcher.messages if message.booking_id == "res_notification_missing_contact"]
+
+
+def test_create_booking_notification_interface_is_idempotent_for_confirmations(tmp_path):
+    database = seeded_database(tmp_path)
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_direct_notification",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="direct@example.test",
+        guest_name="Dina Direct",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=1,
+        children=0,
+    )
+    record_payment_webhook(
+        str(database),
+        provider_reference="fx_direct_notification",
+        reservation_id=reservation["id"],
+        amount_cents=reservation["total"]["amountCents"],
+    )
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        first = create_booking_notification(connection, reservation["id"], BOOKING_CONFIRMATION, created_at="2031-04-01T10:06:00Z")
+        second = create_booking_notification(connection, reservation["id"], BOOKING_CONFIRMATION, created_at="2031-04-01T10:07:00Z")
+        rows = notification_rows(connection, reservation["id"])
+    assert first["duplicate"] is True
+    assert second["duplicate"] is True
+    assert [row["kind"] for row in rows].count(BOOKING_CONFIRMATION) == 1
 
 
 def test_payment_success_failure_duplicate_webhook_and_amount_mismatch(tmp_path):
