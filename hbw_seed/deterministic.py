@@ -27,6 +27,7 @@ FIXTURE_DATES = {
 SCHEMA_STATEMENTS = [
     "PRAGMA foreign_keys = ON",
     "DROP VIEW IF EXISTS audit_records",
+    "DROP TABLE IF EXISTS auth_sessions",
     "DROP TABLE IF EXISTS audit_events",
     "DROP TABLE IF EXISTS refunds",
     "DROP TABLE IF EXISTS payment_records",
@@ -51,9 +52,20 @@ SCHEMA_STATEMENTS = [
         id TEXT PRIMARY KEY,
         email TEXT NOT NULL UNIQUE,
         full_name TEXT NOT NULL,
-        role TEXT NOT NULL CHECK (role IN ('admin', 'guest')),
+        role TEXT NOT NULL CHECK (role IN ('admin', 'guest', 'ADMIN', 'GUEST')),
+        password_hash TEXT NOT NULL,
+        is_active INTEGER NOT NULL DEFAULT 1,
         is_test_account INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE auth_sessions (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL,
+        revoked_at TEXT
     )
     """,
     """
@@ -283,8 +295,8 @@ SCHEMA_STATEMENTS = [
 ]
 
 USERS = [
-    ("usr_admin", "admin@example.test", "Avery Admin", "admin", 1, "2031-01-01T00:00:00Z"),
-    ("usr_guest", "guest@example.test", "Gale Guest", "guest", 1, "2031-01-01T00:00:00Z"),
+    ("usr_admin", "admin@example.test", "Avery Admin", "admin", "pbkdf2_sha256$310000$fixtureadminsalt$pm80aNFSuD5HVO/zFRzvT5cW7r4yhAaGpkFFo3o/g5s=", 1, 1, "2031-01-01T00:00:00Z"),
+    ("usr_guest", "guest@example.test", "Gale Guest", "guest", "pbkdf2_sha256$310000$fixtureguestsalt$Kil92nf0INfpaF2qQAJIZhzdgLh8GcWxblhvONThjA0=", 1, 1, "2031-01-01T00:00:00Z"),
 ]
 
 HOTELS = [
