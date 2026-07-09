@@ -26,6 +26,18 @@ FIXTURE_DATES = {
 
 SCHEMA_STATEMENTS = [
     "PRAGMA foreign_keys = ON",
+    "DROP TABLE IF EXISTS flight_baggage_summaries",
+    "DROP TABLE IF EXISTS flight_passenger_type_pricing",
+    "DROP TABLE IF EXISTS flight_fare_details",
+    "DROP TABLE IF EXISTS flight_offer_segments",
+    "DROP TABLE IF EXISTS flight_offer_itineraries",
+    "DROP TABLE IF EXISTS flight_offer_provider_refs",
+    "DROP TABLE IF EXISTS flight_offers",
+    "DROP TABLE IF EXISTS flight_search_sessions",
+    "DROP TABLE IF EXISTS flight_search_passengers",
+    "DROP TABLE IF EXISTS flight_search_legs",
+    "DROP TABLE IF EXISTS flight_search_requests",
+    "DROP TABLE IF EXISTS flight_carriers",
     "DROP TABLE IF EXISTS audit_records",
     "DROP TABLE IF EXISTS refunds",
     "DROP TABLE IF EXISTS payment_records",
@@ -53,6 +65,160 @@ SCHEMA_STATEMENTS = [
         role TEXT NOT NULL CHECK (role IN ('admin', 'guest')),
         is_test_account INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE flight_carriers (
+        code TEXT PRIMARY KEY CHECK (length(code) BETWEEN 2 AND 3),
+        name TEXT NOT NULL,
+        country_code TEXT CHECK (country_code IS NULL OR (length(country_code) = 2 AND country_code = upper(country_code)))
+    )
+    """,
+    """
+    CREATE TABLE flight_search_requests (
+        id TEXT PRIMARY KEY,
+        user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        trip_type TEXT NOT NULL CHECK (trip_type IN ('one_way', 'round_trip', 'multi_city')),
+        cabin TEXT NOT NULL CHECK (cabin IN ('economy', 'premium_economy', 'business', 'first')),
+        fare_brand TEXT,
+        currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
+        requested_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE flight_search_legs (
+        id TEXT PRIMARY KEY,
+        search_request_id TEXT NOT NULL REFERENCES flight_search_requests(id) ON DELETE CASCADE,
+        leg_index INTEGER NOT NULL CHECK (leg_index >= 0),
+        origin_airport_code TEXT NOT NULL CHECK (length(origin_airport_code) = 3 AND origin_airport_code = upper(origin_airport_code)),
+        destination_airport_code TEXT NOT NULL CHECK (length(destination_airport_code) = 3 AND destination_airport_code = upper(destination_airport_code)),
+        departure_date TEXT NOT NULL,
+        UNIQUE (search_request_id, leg_index)
+    )
+    """,
+    """
+    CREATE TABLE flight_search_passengers (
+        id TEXT PRIMARY KEY,
+        search_request_id TEXT NOT NULL REFERENCES flight_search_requests(id) ON DELETE CASCADE,
+        passenger_type TEXT NOT NULL CHECK (passenger_type IN ('adult', 'child', 'infant')),
+        count INTEGER NOT NULL CHECK (count > 0),
+        UNIQUE (search_request_id, passenger_type)
+    )
+    """,
+    """
+    CREATE TABLE flight_search_sessions (
+        id TEXT PRIMARY KEY,
+        search_request_id TEXT NOT NULL REFERENCES flight_search_requests(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        status TEXT NOT NULL CHECK (status IN ('active', 'expired')),
+        created_at TEXT NOT NULL,
+        expires_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE flight_offers (
+        id TEXT PRIMARY KEY,
+        search_session_id TEXT NOT NULL REFERENCES flight_search_sessions(id) ON DELETE CASCADE,
+        trip_type TEXT NOT NULL CHECK (trip_type IN ('one_way', 'round_trip', 'multi_city')),
+        source TEXT NOT NULL CHECK (source IN ('search_result', 'selected_offer')),
+        status TEXT NOT NULL CHECK (status IN ('available', 'priced_changed', 'unavailable', 'expired')),
+        currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
+        base_amount_cents INTEGER NOT NULL CHECK (base_amount_cents >= 0),
+        tax_amount_cents INTEGER NOT NULL CHECK (tax_amount_cents >= 0),
+        total_amount_cents INTEGER NOT NULL CHECK (total_amount_cents >= 0),
+        refundable INTEGER NOT NULL CHECK (refundable IN (0, 1)),
+        changeable INTEGER NOT NULL CHECK (changeable IN (0, 1)),
+        expires_at TEXT NOT NULL,
+        last_ticketing_date TEXT,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE flight_offer_provider_refs (
+        offer_id TEXT PRIMARY KEY REFERENCES flight_offers(id) ON DELETE CASCADE,
+        provider TEXT NOT NULL,
+        provider_offer_id TEXT NOT NULL,
+        provider_search_id TEXT,
+        reference_expires_at TEXT NOT NULL,
+        revalidation_token_hash TEXT,
+        sanitized_reference_version INTEGER NOT NULL DEFAULT 1
+    )
+    """,
+    """
+    CREATE TABLE flight_offer_itineraries (
+        id TEXT PRIMARY KEY,
+        offer_id TEXT NOT NULL REFERENCES flight_offers(id) ON DELETE CASCADE,
+        itinerary_index INTEGER NOT NULL CHECK (itinerary_index >= 0),
+        origin_airport_code TEXT NOT NULL CHECK (length(origin_airport_code) = 3 AND origin_airport_code = upper(origin_airport_code)),
+        destination_airport_code TEXT NOT NULL CHECK (length(destination_airport_code) = 3 AND destination_airport_code = upper(destination_airport_code)),
+        duration_minutes INTEGER NOT NULL CHECK (duration_minutes > 0),
+        UNIQUE (offer_id, itinerary_index)
+    )
+    """,
+    """
+    CREATE TABLE flight_offer_segments (
+        id TEXT PRIMARY KEY,
+        offer_id TEXT NOT NULL REFERENCES flight_offers(id) ON DELETE CASCADE,
+        itinerary_index INTEGER NOT NULL,
+        segment_index INTEGER NOT NULL CHECK (segment_index >= 0),
+        origin_airport_code TEXT NOT NULL CHECK (length(origin_airport_code) = 3 AND origin_airport_code = upper(origin_airport_code)),
+        destination_airport_code TEXT NOT NULL CHECK (length(destination_airport_code) = 3 AND destination_airport_code = upper(destination_airport_code)),
+        departure_local_datetime TEXT NOT NULL,
+        departure_timezone TEXT,
+        departure_utc_offset_minutes INTEGER,
+        departure_terminal TEXT,
+        arrival_local_datetime TEXT NOT NULL,
+        arrival_timezone TEXT,
+        arrival_utc_offset_minutes INTEGER,
+        arrival_terminal TEXT,
+        duration_minutes INTEGER NOT NULL CHECK (duration_minutes > 0),
+        overnight INTEGER NOT NULL CHECK (overnight IN (0, 1)),
+        marketing_carrier_code TEXT NOT NULL REFERENCES flight_carriers(code),
+        operating_carrier_code TEXT NOT NULL REFERENCES flight_carriers(code),
+        flight_number TEXT NOT NULL,
+        aircraft_code TEXT,
+        booking_class TEXT,
+        cabin TEXT NOT NULL CHECK (cabin IN ('economy', 'premium_economy', 'business', 'first')),
+        fare_brand TEXT,
+        UNIQUE (offer_id, itinerary_index, segment_index),
+        FOREIGN KEY (offer_id, itinerary_index) REFERENCES flight_offer_itineraries(offer_id, itinerary_index) ON DELETE CASCADE
+    )
+    """,
+    """
+    CREATE TABLE flight_fare_details (
+        id TEXT PRIMARY KEY,
+        offer_id TEXT NOT NULL REFERENCES flight_offers(id) ON DELETE CASCADE,
+        segment_id TEXT REFERENCES flight_offer_segments(id) ON DELETE CASCADE,
+        passenger_type TEXT NOT NULL CHECK (passenger_type IN ('adult', 'child', 'infant')),
+        cabin TEXT NOT NULL CHECK (cabin IN ('economy', 'premium_economy', 'business', 'first')),
+        fare_brand TEXT,
+        fare_basis_code TEXT,
+        booking_class TEXT
+    )
+    """,
+    """
+    CREATE TABLE flight_passenger_type_pricing (
+        id TEXT PRIMARY KEY,
+        offer_id TEXT NOT NULL REFERENCES flight_offers(id) ON DELETE CASCADE,
+        passenger_type TEXT NOT NULL CHECK (passenger_type IN ('adult', 'child', 'infant')),
+        passenger_count INTEGER NOT NULL CHECK (passenger_count > 0),
+        currency TEXT NOT NULL CHECK (length(currency) = 3 AND currency = upper(currency)),
+        base_amount_cents INTEGER NOT NULL CHECK (base_amount_cents >= 0),
+        tax_amount_cents INTEGER NOT NULL CHECK (tax_amount_cents >= 0),
+        total_amount_cents INTEGER NOT NULL CHECK (total_amount_cents >= 0),
+        UNIQUE (offer_id, passenger_type)
+    )
+    """,
+    """
+    CREATE TABLE flight_baggage_summaries (
+        id TEXT PRIMARY KEY,
+        offer_id TEXT NOT NULL REFERENCES flight_offers(id) ON DELETE CASCADE,
+        segment_id TEXT REFERENCES flight_offer_segments(id) ON DELETE CASCADE,
+        passenger_type TEXT NOT NULL CHECK (passenger_type IN ('adult', 'child', 'infant')),
+        carry_on_pieces INTEGER,
+        checked_pieces INTEGER,
+        checked_weight_kg INTEGER,
+        description TEXT
     )
     """,
     """
@@ -261,6 +427,96 @@ USERS = [
     ("usr_guest", "guest@example.test", "Gale Guest", "guest", 1, "2031-01-01T00:00:00Z"),
 ]
 
+FLIGHT_CARRIERS = [
+    ("UA", "United Airlines", "US"),
+    ("NH", "All Nippon Airways", "JP"),
+    ("BA", "British Airways", "GB"),
+    ("AA", "American Airlines", "US"),
+    ("QF", "Qantas", "AU"),
+    ("IB", "Iberia", "ES"),
+]
+
+FLIGHT_SEARCH_REQUESTS = [
+    ("fsr_one_way_sfo_nrt", "usr_guest", "one_way", "economy", "standard", "USD", "2031-05-01T10:00:00Z"),
+    ("fsr_round_trip_sfo_lhr", "usr_guest", "round_trip", "business", "flex", "USD", "2031-05-01T10:05:00Z"),
+    ("fsr_multi_city_pacific", None, "multi_city", "premium_economy", None, "USD", "2031-05-01T10:10:00Z"),
+]
+
+FLIGHT_SEARCH_LEGS = [
+    ("fsl_one_way_out", "fsr_one_way_sfo_nrt", 0, "SFO", "NRT", "2031-07-10"),
+    ("fsl_round_out", "fsr_round_trip_sfo_lhr", 0, "SFO", "LHR", "2031-08-01"),
+    ("fsl_round_return", "fsr_round_trip_sfo_lhr", 1, "LHR", "SFO", "2031-08-15"),
+    ("fsl_multi_one", "fsr_multi_city_pacific", 0, "SFO", "HND", "2031-09-01"),
+    ("fsl_multi_two", "fsr_multi_city_pacific", 1, "HND", "SYD", "2031-09-07"),
+    ("fsl_multi_three", "fsr_multi_city_pacific", 2, "SYD", "LAX", "2031-09-20"),
+]
+
+FLIGHT_SEARCH_PASSENGERS = [
+    ("fsp_one_adult", "fsr_one_way_sfo_nrt", "adult", 1),
+    ("fsp_round_adult", "fsr_round_trip_sfo_lhr", "adult", 2),
+    ("fsp_round_child", "fsr_round_trip_sfo_lhr", "child", 1),
+    ("fsp_multi_adult", "fsr_multi_city_pacific", "adult", 1),
+]
+
+FLIGHT_SEARCH_SESSIONS = [
+    ("fss_one_way_active", "fsr_one_way_sfo_nrt", "fixture_air", "active", "2031-05-01T10:00:03Z", "2031-05-01T10:20:03Z"),
+    ("fss_round_active", "fsr_round_trip_sfo_lhr", "fixture_air", "active", "2031-05-01T10:05:03Z", "2031-05-01T10:25:03Z"),
+    ("fss_multi_expired", "fsr_multi_city_pacific", "fixture_air", "expired", "2031-05-01T10:10:03Z", "2031-05-01T10:30:03Z"),
+]
+
+FLIGHT_OFFERS = [
+    ("fo_one_way_codeshare", "fss_one_way_active", "one_way", "search_result", "available", "USD", 62000, 8100, 70100, 0, 1, "2031-05-01T10:15:03Z", "2031-06-10", "2031-05-01T10:00:05Z"),
+    ("fo_round_trip_business", "fss_round_active", "round_trip", "selected_offer", "available", "USD", 855000, 92000, 947000, 1, 1, "2031-05-01T10:23:03Z", "2031-07-01", "2031-05-01T10:05:05Z"),
+    ("fo_multi_city_expired", "fss_multi_expired", "multi_city", "selected_offer", "available", "USD", 212000, 34000, 246000, 0, 0, "2031-05-01T10:20:03Z", None, "2031-05-01T10:10:05Z"),
+]
+
+FLIGHT_OFFER_PROVIDER_REFS = [
+    ("fo_one_way_codeshare", "fixture_air", "fx_offer_ow_001", "fx_search_ow_001", "2031-05-01T10:15:03Z", "sha256:oneway", 1),
+    ("fo_round_trip_business", "fixture_air", "fx_offer_rt_002", "fx_search_rt_002", "2031-05-01T10:23:03Z", "sha256:round", 1),
+    ("fo_multi_city_expired", "fixture_air", "fx_offer_mc_003", "fx_search_mc_003", "2031-05-01T10:20:03Z", "sha256:multi", 1),
+]
+
+FLIGHT_OFFER_ITINERARIES = [
+    ("foi_one_way_0", "fo_one_way_codeshare", 0, "SFO", "NRT", 660),
+    ("foi_round_0", "fo_round_trip_business", 0, "SFO", "LHR", 620),
+    ("foi_round_1", "fo_round_trip_business", 1, "LHR", "SFO", 670),
+    ("foi_multi_0", "fo_multi_city_expired", 0, "SFO", "HND", 650),
+    ("foi_multi_1", "fo_multi_city_expired", 1, "HND", "SYD", 590),
+    ("foi_multi_2", "fo_multi_city_expired", 2, "SYD", "LAX", 820),
+]
+
+FLIGHT_OFFER_SEGMENTS = [
+    ("fos_one_way_codeshare_0", "fo_one_way_codeshare", 0, 0, "SFO", "NRT", "2031-07-10T11:30:00", "America/Los_Angeles", -420, "G", "2031-07-11T14:30:00", "Asia/Tokyo", 540, "1", 660, 1, "UA", "NH", "837", "789", "K", "economy", "standard"),
+    ("fos_round_out_0", "fo_round_trip_business", 0, 0, "SFO", "LHR", "2031-08-01T19:15:00", "America/Los_Angeles", -420, "I", "2031-08-02T13:35:00", "Europe/London", 60, "5", 620, 1, "BA", "BA", "286", "388", "J", "business", "flex"),
+    ("fos_round_return_0", "fo_round_trip_business", 1, 0, "LHR", "SFO", "2031-08-15T15:10:00", "Europe/London", 60, "5", "2031-08-15T18:20:00", "America/Los_Angeles", -420, "I", 670, 0, "BA", "AA", "285", "777", "J", "business", "flex"),
+    ("fos_multi_0", "fo_multi_city_expired", 0, 0, "SFO", "HND", "2031-09-01T12:10:00", "America/Los_Angeles", -420, None, "2031-09-02T15:00:00", "Asia/Tokyo", 540, None, 650, 1, "UA", "NH", "875", None, "W", "premium_economy", None),
+    ("fos_multi_1", "fo_multi_city_expired", 1, 0, "HND", "SYD", "2031-09-07T22:00:00", "Asia/Tokyo", 540, "3", "2031-09-08T08:50:00", "Australia/Sydney", 600, "1", 590, 1, "QF", "QF", "26", "333", "T", "premium_economy", None),
+    ("fos_multi_2", "fo_multi_city_expired", 2, 0, "SYD", "LAX", "2031-09-20T10:20:00", "Australia/Sydney", 600, "1", "2031-09-20T06:00:00", "America/Los_Angeles", -420, "B", 820, 0, "QF", "AA", "11", "388", "T", "premium_economy", None),
+]
+
+FLIGHT_FARE_DETAILS = [
+    ("ffd_one_adult", "fo_one_way_codeshare", "fos_one_way_codeshare_0", "adult", "economy", "standard", "KFIXOW", "K"),
+    ("ffd_round_adult_out", "fo_round_trip_business", "fos_round_out_0", "adult", "business", "flex", "JFIXRT", "J"),
+    ("ffd_round_child_out", "fo_round_trip_business", "fos_round_out_0", "child", "business", "flex", "JFIXCH", "J"),
+    ("ffd_round_adult_ret", "fo_round_trip_business", "fos_round_return_0", "adult", "business", "flex", "JFIXRT", "J"),
+    ("ffd_round_child_ret", "fo_round_trip_business", "fos_round_return_0", "child", "business", "flex", "JFIXCH", "J"),
+    ("ffd_multi_adult", "fo_multi_city_expired", None, "adult", "premium_economy", None, None, "T"),
+]
+
+FLIGHT_PASSENGER_TYPE_PRICING = [
+    ("fptp_one_adult", "fo_one_way_codeshare", "adult", 1, "USD", 62000, 8100, 70100),
+    ("fptp_round_adult", "fo_round_trip_business", "adult", 2, "USD", 620000, 70000, 690000),
+    ("fptp_round_child", "fo_round_trip_business", "child", 1, "USD", 235000, 22000, 257000),
+    ("fptp_multi_adult", "fo_multi_city_expired", "adult", 1, "USD", 212000, 34000, 246000),
+]
+
+FLIGHT_BAGGAGE_SUMMARIES = [
+    ("fbs_one_adult", "fo_one_way_codeshare", "fos_one_way_codeshare_0", "adult", 1, 1, 23, "One carry-on and one checked bag up to 23 kg."),
+    ("fbs_round_adult", "fo_round_trip_business", None, "adult", 2, 2, 32, "Two carry-ons and two checked bags up to 32 kg each."),
+    ("fbs_round_child", "fo_round_trip_business", None, "child", 1, 1, 23, "Child allowance includes one checked bag."),
+    ("fbs_multi_adult", "fo_multi_city_expired", None, "adult", None, None, None, "Provider did not include baggage allowance."),
+]
+
 HOTELS = [
     (
         "htl_sfo_bay",
@@ -444,6 +700,18 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
             connection.execute(statement)
 
         _insert_many(connection, "users", USERS)
+        _insert_many(connection, "flight_carriers", FLIGHT_CARRIERS)
+        _insert_many(connection, "flight_search_requests", FLIGHT_SEARCH_REQUESTS)
+        _insert_many(connection, "flight_search_legs", FLIGHT_SEARCH_LEGS)
+        _insert_many(connection, "flight_search_passengers", FLIGHT_SEARCH_PASSENGERS)
+        _insert_many(connection, "flight_search_sessions", FLIGHT_SEARCH_SESSIONS)
+        _insert_many(connection, "flight_offers", FLIGHT_OFFERS)
+        _insert_many(connection, "flight_offer_provider_refs", FLIGHT_OFFER_PROVIDER_REFS)
+        _insert_many(connection, "flight_offer_itineraries", FLIGHT_OFFER_ITINERARIES)
+        _insert_many(connection, "flight_offer_segments", FLIGHT_OFFER_SEGMENTS)
+        _insert_many(connection, "flight_fare_details", FLIGHT_FARE_DETAILS)
+        _insert_many(connection, "flight_passenger_type_pricing", FLIGHT_PASSENGER_TYPE_PRICING)
+        _insert_many(connection, "flight_baggage_summaries", FLIGHT_BAGGAGE_SUMMARIES)
         _insert_many(connection, "hotels", HOTELS)
         _insert_many(connection, "amenities", AMENITIES)
         _insert_many(connection, "hotel_amenities", HOTEL_AMENITIES)
@@ -462,6 +730,18 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
 
         tables = [
             "users",
+            "flight_carriers",
+            "flight_search_requests",
+            "flight_search_legs",
+            "flight_search_passengers",
+            "flight_search_sessions",
+            "flight_offers",
+            "flight_offer_provider_refs",
+            "flight_offer_itineraries",
+            "flight_offer_segments",
+            "flight_fare_details",
+            "flight_passenger_type_pricing",
+            "flight_baggage_summaries",
             "user_profiles",
             "contact_details",
             "passenger_profiles",
