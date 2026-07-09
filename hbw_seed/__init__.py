@@ -1,6 +1,6 @@
 """Deterministic hotel booking seed data package."""
 
-__all__ = ["FIXTURE_DATES", "reset_and_seed"]
+__all__ = ["FIXTURE_DATES", "reset_and_seed", "ui_contracts"]
 
 
 def reset_and_seed(database_path):
