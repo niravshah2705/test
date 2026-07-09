@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from concurrent.futures import ThreadPoolExecutor
 
 from hbw_seed import reset_and_seed
 from hbw_seed.auth import canAdministerHotel, canCancelReservation, canViewReservation
@@ -30,7 +31,7 @@ from hbw_seed.booking import (
     record_payment_webhook,
     validate_occupancy,
 )
-from hbw_seed.public_api import handle_get
+from hbw_seed.public_api import handle_get, handle_post
 
 
 def seeded_database(tmp_path):
@@ -313,7 +314,151 @@ def test_reservation_creation_is_transactional_for_last_room_and_duplicate_reque
 
     with sqlite3.connect(database) as connection:
         count = connection.execute("SELECT COUNT(*) FROM reservations WHERE id LIKE 'res_%last_room%' ").fetchone()[0]
+        reservation_room = connection.execute(
+            "SELECT reservation_id, room_id, room_type_id, check_in, check_out FROM reservation_rooms WHERE reservation_id = 'res_last_room'"
+        ).fetchone()
     assert count == 1
+    assert reservation_room == ("res_last_room", "room_garden_family_302", "rt_garden_family", "2031-06-10", "2031-06-12")
+
+
+def test_public_post_reservations_supports_slug_idempotency_and_current_price(tmp_path):
+    database = seeded_database(tmp_path)
+    stale_availability = handle_get(
+        str(database),
+        "/api/hotels/mission-garden-inn/availability",
+        "checkIn=2031-06-12&checkOut=2031-06-14&adults=2&children=1",
+    )
+    assert stale_availability.status_code == 200
+    assert stale_availability.body["data"]["roomTypes"][0]["price"]["amountCents"] == 26000
+    admin_update_room_type(str(database), room_type_id="rt_garden_family", user_id="usr_admin", changes={"nightly_rate_cents": 27000})
+
+    payload = {
+        "hotelSlug": "mission-garden-inn",
+        "roomTypeId": "rt_garden_family",
+        "userId": "usr_guest",
+        "guestEmail": "guest@example.test",
+        "guestName": "Gale Guest",
+        "checkIn": "2031-06-12",
+        "checkOut": "2031-06-14",
+        "adults": 2,
+        "children": 1,
+        "idempotencyKey": "retry-safe-key-1",
+    }
+    created = handle_post(str(database), "/api/reservations", payload)
+    duplicate = handle_post(str(database), "/api/reservations", dict(payload))
+    changed_retry = handle_post(str(database), "/api/reservations", {**payload, "children": 0})
+
+    assert created.status_code == 201
+    assert created.body["data"]["reference"] == created.body["data"]["id"]
+    assert created.body["data"]["status"] == "pending_payment"
+    assert created.body["data"]["total"] == {"amountCents": 54000, "currency": "USD", "formatted": "USD 540.00"}
+    assert created.body["data"]["nextStep"] == {
+        "type": "payment",
+        "href": f"/api/reservations/{created.body['data']['id']}/payments",
+        "expiresAt": "2031-06-09T23:59:00Z",
+    }
+    assert duplicate.status_code == 200
+    assert duplicate.body["data"]["id"] == created.body["data"]["id"]
+    assert duplicate.body["data"]["duplicateRequest"] is True
+    assert changed_retry.status_code == 409
+    assert changed_retry.body["error"] == {
+        "code": "idempotency_conflict",
+        "message": "Idempotency key was already used for a different reservation request.",
+    }
+
+
+def test_public_post_reservations_rejects_inactive_entities_and_invalid_occupancy(tmp_path):
+    database = seeded_database(tmp_path)
+    admin_update_hotel(str(database), hotel_id="htl_sfo_garden", user_id="usr_admin", changes={"is_searchable": 0})
+
+    inactive_hotel = handle_post(
+        str(database),
+        "/api/reservations",
+        {
+            "hotelSlug": "mission-garden-inn",
+            "roomTypeId": "rt_garden_family",
+            "guestEmail": "guest@example.test",
+            "guestName": "Gale Guest",
+            "checkIn": "2031-06-12",
+            "checkOut": "2031-06-14",
+            "adults": 2,
+            "children": 1,
+        },
+    )
+    assert inactive_hotel.status_code == 400
+    assert inactive_hotel.body["error"]["message"] == "Hotel is inactive or not found."
+
+    database = seeded_database(tmp_path)
+    admin_update_room(str(database), room_id="room_garden_family_301", user_id="usr_admin", changes={"status": "maintenance"})
+    admin_update_room(str(database), room_id="room_garden_family_302", user_id="usr_admin", changes={"status": "maintenance"})
+    inactive_room_type = handle_post(
+        str(database),
+        "/api/reservations",
+        {
+            "hotelId": "htl_sfo_garden",
+            "roomTypeId": "rt_garden_family",
+            "guestEmail": "guest@example.test",
+            "guestName": "Gale Guest",
+            "checkIn": "2031-06-12",
+            "checkOut": "2031-06-14",
+            "adults": 2,
+            "children": 1,
+        },
+    )
+    over_occupancy = handle_post(
+        str(database),
+        "/api/reservations",
+        {
+            "hotelId": "htl_sfo_bay",
+            "roomTypeId": "rt_bay_king",
+            "guestEmail": "guest@example.test",
+            "guestName": "Gale Guest",
+            "checkIn": "2031-06-12",
+            "checkOut": "2031-06-14",
+            "adults": 2,
+            "children": 1,
+        },
+    )
+    assert inactive_room_type.status_code == 400
+    assert inactive_room_type.body["error"]["message"] == "Room type is inactive or not found for hotel."
+    assert over_occupancy.status_code == 400
+    assert over_occupancy.body["error"]["message"] == "Guest count exceeds room capacity."
+
+
+def test_concurrent_public_reservation_attempts_for_last_room_cannot_both_succeed(tmp_path):
+    database = seeded_database(tmp_path)
+    payload = {
+        "hotelSlug": "mission-garden-inn",
+        "roomTypeId": "rt_garden_family",
+        "userId": "usr_guest",
+        "guestEmail": "guest@example.test",
+        "guestName": "Gale Guest",
+        "checkIn": "2031-06-10",
+        "checkOut": "2031-06-12",
+        "adults": 2,
+        "children": 1,
+    }
+
+    def reserve(index):
+        return handle_post(str(database), "/api/reservations", {**payload, "idempotencyKey": f"concurrent-{index}"})
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        responses = list(executor.map(reserve, (1, 2)))
+
+    status_codes = sorted(response.status_code for response in responses)
+    assert status_codes == [201, 409]
+    conflict = next(response for response in responses if response.status_code == 409)
+    assert conflict.body["error"] == {"code": "inventory_conflict", "message": "No rooms available for the requested stay."}
+    with sqlite3.connect(database) as connection:
+        rows = connection.execute(
+            """
+            SELECT reservation.id, reservation_rooms.room_id
+            FROM reservations AS reservation
+            JOIN reservation_rooms ON reservation_rooms.reservation_id = reservation.id
+            WHERE reservation.id LIKE 'res_idem_%'
+            """
+        ).fetchall()
+    assert len(rows) == 1
 
 
 def test_expired_pending_reservation_releases_inventory(tmp_path):

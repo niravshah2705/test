@@ -30,6 +30,8 @@ SCHEMA_STATEMENTS = [
     "DROP TABLE IF EXISTS refunds",
     "DROP TABLE IF EXISTS payment_records",
     "DROP TABLE IF EXISTS availability_blocks",
+    "DROP TABLE IF EXISTS reservation_idempotency_keys",
+    "DROP TABLE IF EXISTS reservation_rooms",
     "DROP TABLE IF EXISTS reservations",
     "DROP TABLE IF EXISTS reviews",
     "DROP TABLE IF EXISTS room_images",
@@ -156,6 +158,24 @@ SCHEMA_STATEMENTS = [
         cancelled_at TEXT,
         expires_at TEXT,
         confirmation_secret TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE reservation_rooms (
+        reservation_id TEXT NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+        room_id TEXT NOT NULL REFERENCES rooms(id) ON DELETE CASCADE,
+        room_type_id TEXT NOT NULL REFERENCES room_types(id) ON DELETE CASCADE,
+        check_in TEXT NOT NULL,
+        check_out TEXT NOT NULL,
+        PRIMARY KEY (reservation_id, room_id)
+    )
+    """,
+    """
+    CREATE TABLE reservation_idempotency_keys (
+        idempotency_key TEXT PRIMARY KEY,
+        reservation_id TEXT NOT NULL UNIQUE REFERENCES reservations(id) ON DELETE CASCADE,
+        request_fingerprint TEXT NOT NULL,
+        created_at TEXT NOT NULL
     )
     """,
     """
@@ -404,6 +424,11 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
         _insert_many(connection, "room_images", ROOM_IMAGES)
         _insert_many(connection, "reviews", REVIEWS)
         _insert_many(connection, "reservations", RESERVATIONS)
+        _insert_many(
+            connection,
+            "reservation_rooms",
+            ((reservation[0], reservation[3], reservation[2], reservation[7], reservation[8]) for reservation in RESERVATIONS),
+        )
         _insert_many(connection, "availability_blocks", AVAILABILITY_BLOCKS)
         _insert_many(connection, "payment_records", PAYMENTS)
         _insert_many(connection, "refunds", REFUNDS)
@@ -418,6 +443,8 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
             "rooms",
             "reviews",
             "reservations",
+            "reservation_rooms",
+            "reservation_idempotency_keys",
             "availability_blocks",
             "payment_records",
             "refunds",

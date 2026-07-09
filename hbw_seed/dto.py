@@ -80,6 +80,13 @@ def guest_reservation_dto(row: Mapping[str, Any], *, duplicate_request: bool = F
         "total": _format_money(row["total_cents"], row["currency"]),
         "expiresAt": row["expires_at"],
         "cancelledAt": row["cancelled_at"],
+        "nextStep": {
+            "type": "payment",
+            "href": f"/api/reservations/{row['id']}/payments",
+            "expiresAt": row["expires_at"],
+        }
+        if row["status"] == "pending_payment"
+        else None,
     }
     if duplicate_request:
         payload["duplicateRequest"] = True

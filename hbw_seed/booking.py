@@ -8,8 +8,11 @@ same database-backed inventory rules as the public API contract layer.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import secrets
 import sqlite3
+import uuid
 from dataclasses import dataclass
 from datetime import date
 from typing import Any
@@ -37,6 +40,10 @@ class BookingConflict(Exception):
 
 class BookingValidationError(ValueError):
     """Raised for invalid utility/service inputs."""
+
+
+class IdempotencyConflict(BookingConflict):
+    """Raised when an idempotency key is reused for a different request."""
 
 
 def parse_stay_dates(check_in: str, check_out: str) -> StayDates:
@@ -141,23 +148,54 @@ def create_pending_reservation(
     adults: int,
     children: int,
     created_at: str = "2031-04-01T10:00:00Z",
+    idempotency_key: str | None = None,
+    request_fingerprint: str | None = None,
 ) -> dict[str, Any]:
     """Create a pending reservation transactionally against current inventory."""
 
     with _connect(database_path) as connection:
         try:
             connection.execute("BEGIN IMMEDIATE")
+            if idempotency_key:
+                idempotency = connection.execute(
+                    "SELECT * FROM reservation_idempotency_keys WHERE idempotency_key = ?",
+                    (idempotency_key,),
+                ).fetchone()
+                if idempotency is not None:
+                    if request_fingerprint is not None and idempotency["request_fingerprint"] != request_fingerprint:
+                        raise IdempotencyConflict("Idempotency key was already used for a different reservation request.")
+                    duplicate = connection.execute("SELECT * FROM reservations WHERE id = ?", (idempotency["reservation_id"],)).fetchone()
+                    if duplicate is None:
+                        raise BookingConflict("Idempotency key is associated with an unavailable reservation.")
+                    connection.rollback()
+                    return _reservation_payload(duplicate, duplicate_request=True)
+
             duplicate = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
             if duplicate is not None:
                 connection.rollback()
                 return _reservation_payload(duplicate, duplicate_request=True)
 
+            hotel = connection.execute(
+                "SELECT * FROM hotels WHERE id = ? AND is_searchable = 1",
+                (hotel_id,),
+            ).fetchone()
+            if hotel is None:
+                raise BookingValidationError("Hotel is inactive or not found.")
             room_type = connection.execute(
-                "SELECT * FROM room_types WHERE id = ? AND hotel_id = ?",
+                """
+                SELECT room_type.*
+                FROM room_types AS room_type
+                WHERE room_type.id = ?
+                  AND room_type.hotel_id = ?
+                  AND EXISTS (
+                    SELECT 1 FROM rooms AS room
+                    WHERE room.room_type_id = room_type.id AND room.status = 'active'
+                  )
+                """,
                 (room_type_id, hotel_id),
             ).fetchone()
             if room_type is None:
-                raise BookingValidationError("Unknown room type for hotel.")
+                raise BookingValidationError("Room type is inactive or not found for hotel.")
             validate_occupancy(adults, children, room_type["capacity"])
             total_cents = calculate_total_cents(room_type["nightly_rate_cents"], check_in, check_out)
             room_ids = available_room_ids(connection, hotel_id, room_type_id, check_in, check_out)
@@ -189,6 +227,15 @@ def create_pending_reservation(
                     _generate_confirmation_secret(),
                 ),
             )
+            connection.execute(
+                "INSERT INTO reservation_rooms VALUES (?, ?, ?, ?, ?)",
+                (reservation_id, room_ids[0], room_type_id, check_in, check_out),
+            )
+            if idempotency_key:
+                connection.execute(
+                    "INSERT INTO reservation_idempotency_keys VALUES (?, ?, ?, ?)",
+                    (idempotency_key, reservation_id, request_fingerprint or "", created_at),
+                )
             record_audit_event(
                 connection,
                 actor=user_actor(user_id),
@@ -202,6 +249,7 @@ def create_pending_reservation(
                     "checkoutType": checkout_type,
                     "totalCents": total_cents,
                     "currency": room_type["currency"],
+                    "idempotencyKey": bool(idempotency_key),
                     "auditWritePolicy": "best effort; reservation correctness wins",
                 },
                 created_at=created_at,
@@ -688,30 +736,52 @@ def admin_delete_availability_block(
 def booking_api_create_reservation(database_path: str, payload: dict[str, Any]) -> ApiResponse:
     """HTTP-shaped create reservation adapter for response contract tests."""
 
-    required = ["reservationId", "hotelId", "roomTypeId", "guestEmail", "guestName", "checkIn", "checkOut", "adults", "children"]
+    required = ["roomTypeId", "guestEmail", "guestName", "checkIn", "checkOut", "adults", "children"]
     missing = [field for field in required if field not in payload]
+    if "hotelId" not in payload and "hotelSlug" not in payload:
+        missing.append("hotelId")
     if missing:
         return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
     try:
-        reservation = create_pending_reservation(
-            database_path,
-            reservation_id=payload["reservationId"],
-            hotel_id=payload["hotelId"],
+        hotel_id = _resolve_active_hotel_id(database_path, hotel_id=payload.get("hotelId"), hotel_slug=payload.get("hotelSlug"))
+        adults = int(payload["adults"])
+        children = int(payload["children"])
+        reservation_id = payload.get("reservationId") or _reservation_id_for_request(payload)
+        request_fingerprint = _reservation_request_fingerprint(
+            hotel_id=hotel_id,
             room_type_id=payload["roomTypeId"],
             user_id=payload.get("userId"),
             guest_email=payload["guestEmail"],
             guest_name=payload["guestName"],
             check_in=payload["checkIn"],
             check_out=payload["checkOut"],
-            adults=int(payload["adults"]),
-            children=int(payload["children"]),
+            adults=adults,
+            children=children,
         )
+        reservation = create_pending_reservation(
+            database_path,
+            reservation_id=reservation_id,
+            hotel_id=hotel_id,
+            room_type_id=payload["roomTypeId"],
+            user_id=payload.get("userId"),
+            guest_email=payload["guestEmail"],
+            guest_name=payload["guestName"],
+            check_in=payload["checkIn"],
+            check_out=payload["checkOut"],
+            adults=adults,
+            children=children,
+            idempotency_key=payload.get("idempotencyKey"),
+            request_fingerprint=request_fingerprint,
+        )
+    except IdempotencyConflict as exc:
+        return error_response(409, "idempotency_conflict", str(exc))
     except BookingConflict as exc:
         return error_response(409, "inventory_conflict", str(exc))
-    except BookingValidationError as exc:
-        return error_response(400, "validation_error", str(exc))
+    except (BookingValidationError, ValueError) as exc:
+        message = str(exc) or "Request body failed validation."
+        return error_response(400, "validation_error", message)
     status_code = 200 if reservation.get("duplicateRequest") else 201
-    return success_response(reservation, status_code=status_code)
+    return success_response(_reservation_creation_payload(reservation), status_code=status_code)
 
 
 def booking_api_get_reservation(database_path: str, reservation_id: str, user_id: str) -> ApiResponse:
@@ -838,6 +908,38 @@ def _admin_update_entity(
             if connection.in_transaction:
                 connection.rollback()
             raise
+
+
+def _resolve_active_hotel_id(database_path: str, *, hotel_id: str | None, hotel_slug: str | None) -> str:
+    with _connect(database_path) as connection:
+        if hotel_id:
+            row = connection.execute("SELECT id FROM hotels WHERE id = ? AND is_searchable = 1", (hotel_id,)).fetchone()
+        elif hotel_slug:
+            row = connection.execute("SELECT id FROM hotels WHERE slug = ? AND is_searchable = 1", (hotel_slug,)).fetchone()
+        else:
+            row = None
+    if row is None:
+        raise BookingValidationError("Hotel is inactive or not found.")
+    return row["id"]
+
+
+def _reservation_id_for_request(payload: dict[str, Any]) -> str:
+    if payload.get("idempotencyKey"):
+        digest = hashlib.sha256(str(payload["idempotencyKey"]).encode("utf-8")).hexdigest()[:24]
+        return f"res_idem_{digest}"
+    return f"res_{uuid.uuid4().hex}"
+
+
+def _reservation_request_fingerprint(**values: Any) -> str:
+    normalized = {key: (value.strip().lower() if key == "guest_email" and isinstance(value, str) else value) for key, value in values.items()}
+    serialized = json.dumps(normalized, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def _reservation_creation_payload(reservation: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(reservation)
+    payload["reference"] = reservation["id"]
+    return payload
 
 
 def _connect(database_path: str) -> sqlite3.Connection:

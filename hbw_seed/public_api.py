@@ -57,6 +57,21 @@ def error_response(
     return ApiResponse(status_code, {"success": False, "data": None, "error": error})
 
 
+def handle_post(database_path: str, path: str, payload: dict[str, Any]) -> ApiResponse:
+    """Dispatch a public POST request path to the matching API handler.
+
+    Supported routes:
+    - ``/api/reservations``
+    """
+
+    if path == "/api/reservations":
+        from .booking import booking_api_create_reservation
+
+        return booking_api_create_reservation(database_path, payload)
+
+    return error_response(404, "not_found", "Endpoint not found.")
+
+
 def handle_get(database_path: str, path: str, query_string: str = "") -> ApiResponse:
     """Dispatch a public GET request path to the matching API handler.
 
