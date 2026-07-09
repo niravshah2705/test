@@ -217,9 +217,21 @@ SCHEMA_STATEMENTS = [
         block_type TEXT NOT NULL CHECK (block_type IN ('hotel_closure', 'room_type_closure', 'room_maintenance')),
         starts_on TEXT NOT NULL,
         ends_on TEXT NOT NULL,
-        reason TEXT NOT NULL
+        reason TEXT NOT NULL,
+        created_by_admin_user_id TEXT NOT NULL REFERENCES users(id) ON DELETE RESTRICT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK (ends_on > starts_on),
+        CHECK (
+            (block_type = 'hotel_closure' AND room_type_id IS NULL AND room_id IS NULL)
+            OR (block_type = 'room_type_closure' AND room_type_id IS NOT NULL AND room_id IS NULL)
+            OR (block_type = 'room_maintenance' AND room_type_id IS NOT NULL AND room_id IS NOT NULL)
+        )
     )
     """,
+    "CREATE INDEX idx_availability_blocks_hotel_dates ON availability_blocks (hotel_id, starts_on, ends_on)",
+    "CREATE INDEX idx_availability_blocks_room_type_dates ON availability_blocks (hotel_id, room_type_id, starts_on, ends_on)",
+    "CREATE INDEX idx_availability_blocks_room_dates ON availability_blocks (hotel_id, room_id, starts_on, ends_on)",
     """
     CREATE TABLE payment_records (
         id TEXT PRIMARY KEY,
@@ -391,9 +403,9 @@ RESERVATIONS = [
 ]
 
 AVAILABILITY_BLOCKS = [
-    ("blk_loft_hotel_closed", "htl_nyc_loft", None, None, "hotel_closure", "2031-06-10", "2031-06-12", "Annual building systems test; all room types unavailable."),
-    ("blk_garden_queen_closed", "htl_sfo_garden", "rt_garden_queen", None, "room_type_closure", "2031-06-10", "2031-06-12", "Courtyard plumbing work; Garden Queen unavailable."),
-    ("blk_bay_suite_maint", "htl_sfo_bay", "rt_bay_suite", "room_bay_suite_602", "room_maintenance", "2031-06-10", "2031-06-11", "HVAC maintenance blocks one suite for one night."),
+    ("blk_loft_hotel_closed", "htl_nyc_loft", None, None, "hotel_closure", "2031-06-10", "2031-06-12", "Annual building systems test; all room types unavailable.", "usr_admin", "2031-03-01T00:01:00Z", "2031-03-01T00:01:00Z"),
+    ("blk_garden_queen_closed", "htl_sfo_garden", "rt_garden_queen", None, "room_type_closure", "2031-06-10", "2031-06-12", "Courtyard plumbing work; Garden Queen unavailable.", "usr_admin", "2031-03-01T00:02:00Z", "2031-03-01T00:02:00Z"),
+    ("blk_bay_suite_maint", "htl_sfo_bay", "rt_bay_suite", "room_bay_suite_602", "room_maintenance", "2031-06-10", "2031-06-11", "HVAC maintenance blocks one suite for one night.", "usr_admin", "2031-03-01T00:03:00Z", "2031-03-01T00:03:00Z"),
 ]
 
 PAYMENTS = [
