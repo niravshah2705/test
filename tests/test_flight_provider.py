@@ -40,6 +40,10 @@ def test_mock_search_returns_one_way_round_trip_multisegment_codeshare_and_missi
     assert offers[1].itineraries[0].segments[1].codeshare is True
     assert offers[1].checked_bags_included is None
     assert isinstance(offers[0].provider_reference, ProviderReference)
+    segment_payload = offers[0].to_payload()["itineraries"][0]["segments"][0]
+    assert segment_payload["marketingCarrierName"] == "Oceanic Air"
+    assert segment_payload["originDisplayName"] == "San Francisco (SFO)"
+    assert segment_payload["destinationDisplayName"] == "New York (JFK)"
     assert offers[0].to_payload()["total"] == {"amountCents": 57200, "currency": "USD", "formatted": "USD 572.00"}
     assert "provider_reference" not in offers[0].to_payload()
     assert "providerReference" not in offers[0].to_payload()

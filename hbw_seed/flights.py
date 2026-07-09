@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, runtime_checkable
 
+from .reference import airline_display, airport_display
+
 SUPPORTED_CURRENCIES = {"USD", "EUR", "GBP", "CAD"}
 DEFAULT_CURRENCY = "USD"
 MOCK_PROVIDER_NAME = "deterministic_mock_air"
@@ -75,10 +77,14 @@ class FlightSegment:
         return {
             "id": self.id,
             "marketingCarrier": self.marketing_carrier,
+            "marketingCarrierName": airline_display(self.marketing_carrier),
             "operatingCarrier": self.operating_carrier,
+            "operatingCarrierName": airline_display(self.operating_carrier),
             "flightNumber": self.flight_number,
             "origin": self.origin,
+            "originDisplayName": airport_display(self.origin),
             "destination": self.destination,
+            "destinationDisplayName": airport_display(self.destination),
             "departsAt": self.departs_at,
             "arrivesAt": self.arrives_at,
             "durationMinutes": self.duration_minutes,

@@ -32,6 +32,13 @@ def test_accessibility_contracts_pass_for_key_pages_forms_dialogs_and_navigation
         "serverRenderedFallback": True,
         "criticalPathsKeyboardReachable": ["search", "select-room", "guest-details", "payment", "confirmation"],
     }
+    assert bundle["referenceApis"]["airportAutocomplete"] == {
+        "endpoint": "/api/reference/airports?query={query}",
+        "method": "GET",
+        "minQueryLength": 1,
+        "resultFields": ["code", "displayName", "city", "country", "timezone"],
+        "matches": ["code", "city", "airportName"],
+    }
     for dialog in bundle["dialogs"].values():
         assert dialog["ariaModal"] is True
         assert dialog["initialFocus"]
@@ -53,6 +60,8 @@ def test_key_forms_have_programmatic_labels_and_field_errors_are_linked():
     assert form["validationAnnouncement"] == form["errorSummary"]
     by_name = {field["name"]: field for field in form["fields"]}
     assert by_name["destination"]["label"] == "Destination"
+    assert by_name["destination"]["autocomplete"] == "off"
+    assert "/api/reference/airports" in by_name["destination"]["helpText"]
     assert by_name["destination"]["errorId"] == "destination-error"
     assert "destination-error" in by_name["destination"]["ariaDescribedBy"]
     assert by_name["destination"]["ariaInvalid"] is True

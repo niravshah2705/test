@@ -18,6 +18,7 @@ from urllib.parse import parse_qs
 
 from .audit import record_audit_event, system_actor
 from .dto import public_hotel_detail_dto, public_hotel_summary_dto, public_room_type_dto
+from .reference import get_airline, get_airport, is_plausible_reference_code, search_airports
 
 MAX_PAGE_SIZE = 50
 DEFAULT_PAGE = 1
@@ -65,11 +66,24 @@ def handle_get(database_path: str, path: str, query_string: str = "") -> ApiResp
     - ``/api/search/hotels``
     - ``/api/hotels/:slug``
     - ``/api/hotels/:slug/availability``
+    - ``/api/reference/airports?query=...``
+    - ``/api/reference/airports/:iataCode``
+    - ``/api/reference/airlines/:code``
     """
 
     query = {key: values[-1] for key, values in parse_qs(query_string, keep_blank_values=True).items()}
     if path == "/api/search/hotels":
         return search_hotels(database_path, query)
+    if path == "/api/reference/airports":
+        return reference_airport_search(query)
+
+    airport_match = re.fullmatch(r"/api/reference/airports/([^/]+)", path)
+    if airport_match:
+        return reference_airport_detail(airport_match.group(1))
+
+    airline_match = re.fullmatch(r"/api/reference/airlines/([^/]+)", path)
+    if airline_match:
+        return reference_airline_detail(airline_match.group(1))
 
     detail_match = re.fullmatch(r"/api/hotels/([^/]+)", path)
     if detail_match:
@@ -164,6 +178,28 @@ def search_hotels(database_path: str, query: dict[str, str]) -> ApiResponse:
         },
     }
     return success_response(data, meta=meta)
+
+
+def reference_airport_search(query: dict[str, str]) -> ApiResponse:
+    return success_response(search_airports(query.get("query")))
+
+
+def reference_airport_detail(iata_code: str) -> ApiResponse:
+    if not is_plausible_reference_code(iata_code):
+        return _validation_error({"iataCode": ["Airport code must be 2 to 4 letters or numbers."]})
+    airport = get_airport(iata_code)
+    if airport is None:
+        return error_response(404, "not_found", "Airport not found.")
+    return success_response(airport)
+
+
+def reference_airline_detail(code: str) -> ApiResponse:
+    if not is_plausible_reference_code(code):
+        return _validation_error({"code": ["Airline code must be 2 to 4 letters or numbers."]})
+    airline = get_airline(code)
+    if airline is None:
+        return error_response(404, "not_found", "Airline not found.")
+    return success_response(airline)
 
 
 def get_hotel_detail(database_path: str, slug: str) -> ApiResponse:

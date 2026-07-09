@@ -142,7 +142,7 @@ _REQUIRED_STATES_BY_PAGE: dict[str, tuple[str, ...]] = {
 
 _FORM_FIELDS: dict[str, tuple[FieldContract, ...]] = {
     "search": (
-        FieldContract("destination", "Destination", required=True, autocomplete="address-level2", help_text="City, country, or hotel name."),
+        FieldContract("destination", "Destination", required=True, autocomplete="off", help_text="Use /api/reference/airports?query=... for API-backed airport autocomplete by code, city, or airport name."),
         FieldContract("checkIn", "Check-in date", "date", required=True),
         FieldContract("checkOut", "Check-out date", "date", required=True),
         FieldContract("adults", "Adults", "number", required=True, help_text="At least one adult is required."),
@@ -267,6 +267,15 @@ def build_ui_contracts() -> dict[str, Any]:
             "skipLinkTarget": "main-content",
             "serverRenderedFallback": True,
             "criticalPathsKeyboardReachable": ["search", "select-room", "guest-details", "payment", "confirmation"],
+        },
+        "referenceApis": {
+            "airportAutocomplete": {
+                "endpoint": "/api/reference/airports?query={query}",
+                "method": "GET",
+                "minQueryLength": 1,
+                "resultFields": ["code", "displayName", "city", "country", "timezone"],
+                "matches": ["code", "city", "airportName"],
+            }
         },
     }
 
