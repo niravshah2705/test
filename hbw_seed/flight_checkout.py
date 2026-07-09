@@ -61,8 +61,8 @@ class BookingDraftRepository:
                 """
                 INSERT INTO flight_booking_drafts (
                     id, offer_id, user_id, checkout_type, contact_email, contact_phone,
-                    total_cents, currency, status, created_at, expires_at, offer_snapshot
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    total_cents, currency, status, created_at, expires_at, offer_snapshot, audit_events
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     immutable["id"],
@@ -77,6 +77,7 @@ class BookingDraftRepository:
                     immutable["createdAt"],
                     immutable["expiresAt"],
                     repr(immutable["offerSnapshot"]),
+                    repr(immutable.get("auditEvents") or []),
                 ),
             )
             for index, passenger in enumerate(immutable["passengerSnapshots"], start=1):
@@ -130,6 +131,7 @@ class BookingDraftRepository:
             "paymentAllowed": draft["status"] in {"price_validated", "price_change_accepted"},
             "paymentAttempts": _parse_snapshot(draft["payment_attempts"]) if "payment_attempts" in draft.keys() else [],
             "providerOrder": _parse_snapshot(draft["provider_order"]) if "provider_order" in draft.keys() else None,
+            "auditEvents": _parse_snapshot(draft["audit_events"]) if "audit_events" in draft.keys() else [],
         }
 
     def update(self, draft_id: str, changes: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -144,8 +146,9 @@ class BookingDraftRepository:
             revalidation = changes.get("revalidation")
             payment_attempts = changes.get("paymentAttempts")
             provider_order = changes.get("providerOrder")
+            audit_events = changes.get("auditEvents")
             connection.execute(
-                "UPDATE flight_booking_drafts SET status = ?, total_cents = ?, currency = ?, revalidation_snapshot = ?, payment_attempts = ?, provider_order = ? WHERE id = ?",
+                "UPDATE flight_booking_drafts SET status = ?, total_cents = ?, currency = ?, revalidation_snapshot = ?, payment_attempts = ?, provider_order = ?, audit_events = ? WHERE id = ?",
                 (
                     status,
                     int(total["amountCents"]),
@@ -153,6 +156,7 @@ class BookingDraftRepository:
                     repr(revalidation) if revalidation is not None else current["revalidation_snapshot"],
                     repr(payment_attempts) if payment_attempts is not None else current["payment_attempts"],
                     repr(provider_order) if provider_order is not None else current["provider_order"],
+                    repr(audit_events) if audit_events is not None else current["audit_events"],
                     draft_id,
                 ),
             )
@@ -332,6 +336,7 @@ def create_booking_draft(
         "passengerSnapshots": snapshots,
         "paymentAttempts": [],
         "providerOrder": None,
+        "auditEvents": [_audit_event("booking_draft.created", status="draft", details={"offerId": offer_id, "checkoutType": "authenticated" if user_id else "guest"})],
     }
     return (repository or InMemoryBookingDraftRepository()).save(draft)
 
@@ -362,16 +367,22 @@ def revalidate_booking_draft(
             draft["offerId"], passengers=tuple(draft.get("passengerSnapshots") or ()), scenario=scenario
         )
     except FlightProviderTimeout as exc:
-        updated = repository.update(draft_id, {"status": "revalidation_failed", "revalidation": _review_snapshot("retryable_failure", draft, None, str(exc), scenario)})
+        updated = _update_with_audit(repository, draft, {"status": "revalidation_failed", "revalidation": _review_snapshot("retryable_failure", draft, None, str(exc), scenario)}, "booking_revalidation.failed", details={"result": "retryable_failure", "scenario": scenario})
         return booking_review_payload(updated or draft)
     except FlightProviderUnavailable as exc:
-        updated = repository.update(draft_id, {"status": "revalidation_failed", "revalidation": _review_snapshot("retryable_failure", draft, None, str(exc), scenario)})
+        updated = _update_with_audit(repository, draft, {"status": "revalidation_failed", "revalidation": _review_snapshot("retryable_failure", draft, None, str(exc), scenario)}, "booking_revalidation.failed", details={"result": "retryable_failure", "scenario": scenario})
         return booking_review_payload(updated or draft)
 
     review_status = _classify_revalidation(draft, result)
     new_total = result.offer.total.to_payload() if result.offer and review_status in {"unchanged", "price_increased", "price_decreased"} else draft["total"]
     next_status = "price_validated" if review_status == "unchanged" else "price_changed" if review_status in {"price_increased", "price_decreased"} else "unavailable"
-    updated = repository.update(draft_id, {"status": next_status, "total": new_total if next_status == "price_validated" else draft["total"], "revalidation": _review_snapshot(review_status, draft, result, result.message, scenario)})
+    updated = _update_with_audit(
+        repository,
+        draft,
+        {"status": next_status, "total": new_total if next_status == "price_validated" else draft["total"], "revalidation": _review_snapshot(review_status, draft, result, result.message, scenario)},
+        "booking_revalidation.completed",
+        details={"result": review_status, "scenario": scenario},
+    )
     return booking_review_payload(updated or draft)
 
 
@@ -382,7 +393,7 @@ def accept_revalidated_price(draft_id: str, *, repository: InMemoryBookingDraftR
     revalidation = draft.get("revalidation") or {}
     if draft["status"] != "price_changed" or revalidation.get("latestTotal") is None:
         raise CheckoutValidationError({"revalidation": ["No changed price is waiting for acceptance."]})
-    updated = repository.update(draft_id, {"status": "price_change_accepted", "total": revalidation["latestTotal"], "revalidation": {**revalidation, "accepted": True}})
+    updated = _update_with_audit(repository, draft, {"status": "price_change_accepted", "total": revalidation["latestTotal"], "revalidation": {**revalidation, "accepted": True}}, "booking_revalidation.price_accepted", details={"result": revalidation.get("status")})
     return booking_review_payload(updated or draft)
 
 
@@ -442,10 +453,10 @@ def finalize_booking_payment(
     if scenario == "declined":
         payment_attempt["status"] = "declined"
         payment_attempt["failureReason"] = "payment_declined"
-        updated = _append_payment_attempt(repository, draft, payment_attempt)
+        updated = _append_payment_attempt(repository, draft, payment_attempt, event_type="booking_payment.declined")
         return _confirmation_payload(updated, payment_attempt)
 
-    draft_with_payment = _append_payment_attempt(repository, draft, payment_attempt)
+    draft_with_payment = _append_payment_attempt(repository, draft, payment_attempt, event_type="booking_payment.authorized")
     try:
         order = FlightBookingService(provider or DeterministicMockFlightProvider()).createOrder(
             FlightOrderRequest(
@@ -457,26 +468,32 @@ def finalize_booking_payment(
         )
     except (FlightProviderTimeout, FlightProviderUnavailable) as exc:
         failed_attempt = {**payment_attempt, "status": "authorized_booking_failed", "failureReason": "provider_booking_failed"}
-        updated = repository.update(
-            draft_id,
+        updated = _update_with_audit(
+            repository,
+            draft_with_payment,
             {
                 "status": "ticketing_pending",
                 "paymentAttempts": _replace_attempt(draft_with_payment.get("paymentAttempts") or [], failed_attempt),
                 "providerOrder": {"status": "failed", "message": str(exc)},
             },
+            "booking_provider_order.failed",
+            details={"failureReason": "provider_booking_failed"},
         )
         return _confirmation_payload(updated or draft_with_payment, failed_attempt)
 
     provider_order = order.to_payload()
     final_status = "finalized" if order.status == "ticketed" else "ticketing_pending"
     captured_attempt = {**payment_attempt, "status": "captured"}
-    updated = repository.update(
-        draft_id,
+    updated = _update_with_audit(
+        repository,
+        draft_with_payment,
         {
             "status": final_status,
             "paymentAttempts": _replace_attempt(draft_with_payment.get("paymentAttempts") or [], captured_attempt),
             "providerOrder": provider_order,
         },
+        "booking_provider_order.created",
+        details={"orderId": provider_order["id"], "orderStatus": provider_order["status"]},
     )
     return _confirmation_payload(updated or draft_with_payment, captured_attempt)
 
@@ -497,7 +514,7 @@ def poll_booking_finalization(
     latest = FlightBookingService(provider or DeterministicMockFlightProvider()).getOrderStatus(order["id"])
     updated_order = latest.to_payload()
     status = "finalized" if latest.status == "ticketed" else "ticketing_pending"
-    updated = repository.update(draft_id, {"status": status, "providerOrder": updated_order})
+    updated = _update_with_audit(repository, draft, {"status": status, "providerOrder": updated_order}, "booking_provider_order.status_refreshed", details={"orderId": updated_order["id"], "orderStatus": updated_order["status"]})
     return _confirmation_payload(updated or draft, attempt)
 
 
@@ -641,10 +658,13 @@ def _payment_attempt(draft: dict[str, Any], idempotency_key: str, payment_token:
     return attempt
 
 
-def _append_payment_attempt(repository: InMemoryBookingDraftRepository | BookingDraftRepository, draft: dict[str, Any], attempt: dict[str, Any]) -> dict[str, Any]:
+def _append_payment_attempt(repository: InMemoryBookingDraftRepository | BookingDraftRepository, draft: dict[str, Any], attempt: dict[str, Any], *, event_type: str | None = None) -> dict[str, Any]:
     attempts = list(draft.get("paymentAttempts") or [])
     attempts.append(attempt)
-    return repository.update(draft["id"], {"paymentAttempts": attempts}) or {**draft, "paymentAttempts": attempts}
+    changes: dict[str, Any] = {"paymentAttempts": attempts}
+    if event_type:
+        return _update_with_audit(repository, draft, changes, event_type, details={"paymentId": attempt["id"], "paymentStatus": attempt["status"]}) or {**draft, **changes}
+    return repository.update(draft["id"], changes) or {**draft, **changes}
 
 
 def _attempt_by_idempotency(draft: dict[str, Any], idempotency_key: str) -> dict[str, Any] | None:
@@ -698,6 +718,24 @@ def _confirmation_payload(draft: dict[str, Any], attempt: dict[str, Any] | None,
         "passengers": [{"name": passenger["legalName"]["fullName"], "passengerType": passenger["passengerType"]} for passenger in draft.get("passengerSnapshots") or []],
         "polling": {"enabled": status == "ticketing_pending", "href": f"/api/payments?bookingId={draft['id']}"},
     }
+
+
+def _audit_event(event_type: str, *, status: str | None = None, details: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    return {"type": event_type, "status": status, "details": copy.deepcopy(dict(details or {}))}
+
+
+def _update_with_audit(
+    repository: InMemoryBookingDraftRepository | BookingDraftRepository,
+    draft: dict[str, Any],
+    changes: Mapping[str, Any],
+    event_type: str,
+    *,
+    details: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    next_status = str(changes.get("status", draft.get("status")))
+    audit_events = list(draft.get("auditEvents") or [])
+    audit_events.append(_audit_event(event_type, status=next_status, details=details))
+    return repository.update(draft["id"], {**dict(changes), "auditEvents": audit_events})
 
 def _validate_contact(raw: Mapping[str, Any], errors: dict[str, list[str]]) -> dict[str, str]:
     email = str(raw.get("email") or "").strip().lower()
@@ -913,11 +951,12 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             offer_snapshot TEXT NOT NULL,
             revalidation_snapshot TEXT,
             payment_attempts TEXT,
-            provider_order TEXT
+            provider_order TEXT,
+            audit_events TEXT
         )
         """
     )
-    for column in ("revalidation_snapshot TEXT", "payment_attempts TEXT", "provider_order TEXT"):
+    for column in ("revalidation_snapshot TEXT", "payment_attempts TEXT", "provider_order TEXT", "audit_events TEXT"):
         try:
             connection.execute(f"ALTER TABLE flight_booking_drafts ADD COLUMN {column}")
         except sqlite3.OperationalError:
