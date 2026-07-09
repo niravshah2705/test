@@ -39,6 +39,10 @@ SCHEMA_STATEMENTS = [
     "DROP TABLE IF EXISTS hotel_policies",
     "DROP TABLE IF EXISTS hotel_amenities",
     "DROP TABLE IF EXISTS amenities",
+    "DROP TABLE IF EXISTS passenger_documents",
+    "DROP TABLE IF EXISTS passenger_profiles",
+    "DROP TABLE IF EXISTS contact_details",
+    "DROP TABLE IF EXISTS user_profiles",
     "DROP TABLE IF EXISTS hotels",
     "DROP TABLE IF EXISTS users",
     """
@@ -49,6 +53,52 @@ SCHEMA_STATEMENTS = [
         role TEXT NOT NULL CHECK (role IN ('admin', 'guest')),
         is_test_account INTEGER NOT NULL DEFAULT 1,
         created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE user_profiles (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        display_name TEXT,
+        legal_given_name TEXT NOT NULL,
+        legal_middle_name TEXT,
+        legal_family_name TEXT NOT NULL,
+        date_of_birth TEXT NOT NULL,
+        gender TEXT CHECK (gender IS NULL OR gender IN ('female', 'male', 'non_binary', 'unspecified')),
+        country_code TEXT NOT NULL CHECK (length(country_code) = 2 AND country_code = upper(country_code))
+    )
+    """,
+    """
+    CREATE TABLE contact_details (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        label TEXT NOT NULL,
+        email TEXT NOT NULL,
+        phone TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE passenger_profiles (
+        id TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        display_name TEXT,
+        legal_given_name TEXT NOT NULL,
+        legal_middle_name TEXT,
+        legal_family_name TEXT NOT NULL,
+        date_of_birth TEXT NOT NULL,
+        passenger_type TEXT NOT NULL CHECK (passenger_type IN ('adult', 'child', 'infant')),
+        gender TEXT CHECK (gender IS NULL OR gender IN ('female', 'male', 'non_binary', 'unspecified')),
+        contact_detail_id TEXT REFERENCES contact_details(id) ON DELETE SET NULL
+    )
+    """,
+    """
+    CREATE TABLE passenger_documents (
+        id TEXT PRIMARY KEY,
+        passenger_profile_id TEXT NOT NULL REFERENCES passenger_profiles(id) ON DELETE CASCADE,
+        document_type TEXT NOT NULL CHECK (document_type IN ('passport', 'national_id', 'drivers_license', 'known_traveler', 'redress')),
+        issuing_country TEXT NOT NULL CHECK (length(issuing_country) = 2 AND issuing_country = upper(issuing_country)),
+        nationality_country TEXT CHECK (nationality_country IS NULL OR (length(nationality_country) = 2 AND nationality_country = upper(nationality_country))),
+        expires_on TEXT,
+        document_number_last4 TEXT CHECK (document_number_last4 IS NULL OR length(document_number_last4) = 4)
     )
     """,
     """
@@ -412,6 +462,10 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
 
         tables = [
             "users",
+            "user_profiles",
+            "contact_details",
+            "passenger_profiles",
+            "passenger_documents",
             "hotels",
             "amenities",
             "room_types",
