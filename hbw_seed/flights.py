@@ -107,6 +107,7 @@ class FlightOffer:
     checked_bags_included: int | None
     provider_reference: ProviderReference
     status: OfferStatus = "available"
+    expires_at: str | None = None
 
     def to_payload(self) -> dict[str, Any]:
         """Return frontend-safe offer data without provider adapter references."""
@@ -120,6 +121,7 @@ class FlightOffer:
             "refundable": self.refundable,
             "checkedBagsIncluded": self.checked_bags_included,
             "status": self.status,
+            "expiresAt": self.expires_at,
         }
 
 
@@ -168,6 +170,7 @@ class FlightSearchRequest:
     return_date: str | None = None
     adults: int = 1
     children: int = 0
+    infants: int = 0
     cabin: str = "economy"
     scenario: str = "success"
 
@@ -305,6 +308,7 @@ def map_provider_offer(raw: dict[str, Any]) -> FlightOffer:
         checked_bags_included=raw.get("baggage", {}).get("checkedBagsIncluded"),
         provider_reference=provider_reference,
         status=raw.get("status", "available"),
+        expires_at=raw.get("expiresAt"),
     )
 
 
@@ -357,7 +361,7 @@ def _default_request() -> FlightSearchRequest:
 
 
 def _offer_payload(offer_id: str, request: FlightSearchRequest, *, missing_baggage: bool = False) -> dict[str, Any]:
-    passenger_count = request.adults + request.children
+    passenger_count = request.adults + request.children + request.infants
     price = 28600 if offer_id.endswith("oneway") else 42800 if offer_id.endswith("multisegment") else 51200
     itinerary = _roundtrip_itineraries(request) if offer_id.endswith("roundtrip") else [_multisegment_itinerary() if offer_id.endswith("multisegment") else _oneway_itinerary(request)]
     baggage = {} if missing_baggage else {"checkedBagsIncluded": 1}
@@ -374,6 +378,7 @@ def _offer_payload(offer_id: str, request: FlightSearchRequest, *, missing_bagga
         "refundable": offer_id.endswith("roundtrip"),
         "baggage": baggage,
         "status": "available",
+        "expiresAt": "2031-07-01T07:45:00Z" if offer_id.endswith("oneway") else "2031-07-02T07:45:00Z",
     }
 
 
