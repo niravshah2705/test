@@ -148,7 +148,7 @@ SCHEMA_STATEMENTS = [
         guest_name TEXT NOT NULL,
         check_in TEXT NOT NULL,
         check_out TEXT NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('confirmed', 'pending_payment', 'cancelled', 'expired')),
+        status TEXT NOT NULL CHECK (status IN ('confirmed', 'pending_payment', 'cancelled', 'expired', 'completed')),
         checkout_type TEXT NOT NULL CHECK (checkout_type IN ('guest', 'authenticated')),
         total_cents INTEGER NOT NULL,
         currency TEXT NOT NULL DEFAULT 'USD',
@@ -179,7 +179,8 @@ SCHEMA_STATEMENTS = [
         amount_cents INTEGER NOT NULL,
         currency TEXT NOT NULL DEFAULT 'USD',
         status TEXT NOT NULL CHECK (status IN ('authorized', 'captured', 'voided', 'refunded')),
-        created_at TEXT NOT NULL
+        created_at TEXT NOT NULL,
+        failure_message TEXT
     )
     """,
     """
@@ -347,11 +348,11 @@ AVAILABILITY_BLOCKS = [
 ]
 
 PAYMENTS = [
-    ("pay_bay_king_guest", "res_bay_king_guest_confirmed", "fixture_gateway", "fx_auth_guest_0001", 48000, "USD", "captured", "2031-03-01T10:05:00Z"),
-    ("pay_bay_king_auth", "res_bay_king_auth_confirmed", "fixture_gateway", "fx_auth_user_0002", 48000, "USD", "captured", "2031-03-01T11:05:00Z"),
-    ("pay_bay_suite_confirmed", "res_bay_suite_confirmed", "fixture_gateway", "fx_auth_user_0003", 84000, "USD", "captured", "2031-03-02T10:05:00Z"),
-    ("pay_garden_family_pending", "res_garden_family_pending", "fixture_gateway", "fx_pending_user_0004", 52000, "USD", "authorized", "2031-03-03T10:05:00Z"),
-    ("pay_bay_suite_cancelled", "res_bay_suite_cancelled", "fixture_gateway", "fx_refund_guest_0005", 84000, "USD", "refunded", "2031-03-04T10:05:00Z"),
+    ("pay_bay_king_guest", "res_bay_king_guest_confirmed", "fixture_gateway", "fx_auth_guest_0001", 48000, "USD", "captured", "2031-03-01T10:05:00Z", None),
+    ("pay_bay_king_auth", "res_bay_king_auth_confirmed", "fixture_gateway", "fx_auth_user_0002", 48000, "USD", "captured", "2031-03-01T11:05:00Z", None),
+    ("pay_bay_suite_confirmed", "res_bay_suite_confirmed", "fixture_gateway", "fx_auth_user_0003", 84000, "USD", "captured", "2031-03-02T10:05:00Z", None),
+    ("pay_garden_family_pending", "res_garden_family_pending", "fixture_gateway", "fx_pending_user_0004", 52000, "USD", "authorized", "2031-03-03T10:05:00Z", None),
+    ("pay_bay_suite_cancelled", "res_bay_suite_cancelled", "fixture_gateway", "fx_refund_guest_0005", 84000, "USD", "refunded", "2031-03-04T10:05:00Z", None),
 ]
 
 REFUNDS = [

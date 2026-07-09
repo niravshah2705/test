@@ -23,6 +23,26 @@ MAX_GUESTS = 12
 HOLD_EXPIRES_AT = "2031-06-09T23:59:00Z"
 PAYMENT_PROVIDER = "fixture_gateway"
 
+RESERVATION_TRANSITIONS = {
+    "pending_payment": {"confirmed", "expired", "cancelled"},
+    "confirmed": {"cancelled", "completed"},
+    "expired": set(),
+    "cancelled": set(),
+    "completed": set(),
+}
+PAYMENT_TRANSITIONS = {
+    None: {"authorized", "captured", "voided"},
+    "authorized": {"captured", "voided"},
+    "captured": {"refunded"},
+    "voided": {"authorized"},
+    "refunded": set(),
+}
+PAYMENT_PROVIDER_EVENTS = {
+    "payment.authorized": "authorized",
+    "payment.succeeded": "captured",
+    "payment.failed": "voided",
+}
+
 
 @dataclass(frozen=True)
 class StayDates:
@@ -84,6 +104,37 @@ def calculate_total_cents(nightly_rate_cents: int, check_in: str, check_out: str
     if nightly_rate_cents < 0:
         raise BookingValidationError("nightly_rate_cents must be non-negative.")
     return nightly_rate_cents * parse_stay_dates(check_in, check_out).nights
+
+
+def assert_reservation_transition(current_status: str, next_status: str, *, via: str) -> None:
+    """Validate centralized reservation lifecycle transitions."""
+
+    allowed = RESERVATION_TRANSITIONS.get(current_status)
+    if allowed is None or next_status not in allowed:
+        raise BookingConflict(f"Reservation cannot transition from {current_status} to {next_status} via {via}.")
+
+
+def assert_payment_transition(current_status: str | None, next_status: str, *, amount_cents: int, captured_cents: int = 0, refunded_cents: int = 0) -> None:
+    """Validate centralized provider-derived payment lifecycle transitions and refund limits."""
+
+    allowed = PAYMENT_TRANSITIONS.get(current_status)
+    if allowed is None or next_status not in allowed:
+        display_current = current_status if current_status is not None else "new"
+        raise BookingConflict(f"Payment cannot transition from {display_current} to {next_status}.")
+    if next_status == "refunded" and refunded_cents + amount_cents > captured_cents:
+        raise BookingConflict("Refund amount cannot exceed captured payment amount.")
+
+
+def assert_stay_completed(check_out: str, *, today: str) -> None:
+    """Validate date-only completion rules for stays after checkout date."""
+
+    try:
+        checkout_date = date.fromisoformat(check_out)
+        today_date = date.fromisoformat(today)
+    except ValueError as exc:
+        raise BookingValidationError("Dates must use YYYY-MM-DD format.") from exc
+    if today_date <= checkout_date:
+        raise BookingConflict("Reservation stay has not passed date-only completion rules.")
 
 
 def available_room_ids(
@@ -222,7 +273,17 @@ def expire_pending_reservation(database_path: str, reservation_id: str, *, now: 
         row = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
         if row is None or row["status"] != "pending_payment" or row["expires_at"] is None or now <= row["expires_at"]:
             return False
+        assert_reservation_transition(row["status"], "expired", via="expiration_service")
         connection.execute("UPDATE reservations SET status = 'expired' WHERE id = ?", (reservation_id,))
+        record_audit_event(
+            connection,
+            actor=system_actor(),
+            event_type="reservation.expired",
+            entity_type="reservation",
+            entity_id=reservation_id,
+            metadata={"auditWritePolicy": "best effort; expiration correctness wins"},
+            created_at=now,
+        )
         connection.commit()
         return True
 
@@ -236,103 +297,157 @@ def record_payment_webhook(
     currency: str = "USD",
     event_type: str = "payment.succeeded",
     created_at: str = "2031-04-01T10:05:00Z",
+    failure_message: str | None = None,
 ) -> dict[str, Any]:
-    """Persist successful/failed payment provider events idempotently."""
+    """Persist provider payment events idempotently only when lifecycle rules allow them."""
 
     with _connect(database_path) as connection:
-        existing = connection.execute(
-            "SELECT * FROM payment_records WHERE provider = ? AND provider_reference = ?",
-            (PAYMENT_PROVIDER, provider_reference),
-        ).fetchone()
-        if existing is not None:
-            return {"duplicate": True, "paymentId": existing["id"], "status": existing["status"]}
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            reservation = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+            if reservation is None:
+                raise BookingValidationError("Unknown reservation.")
+            status = PAYMENT_PROVIDER_EVENTS.get(event_type)
+            if status is None:
+                raise BookingValidationError("Unsupported payment provider event.")
 
-        reservation = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
-        if reservation is None:
-            raise BookingValidationError("Unknown reservation.")
-        if amount_cents != reservation["total_cents"] or currency != reservation["currency"]:
-            connection.execute(
-                """
-                INSERT INTO payment_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    f"pay_{provider_reference}",
-                    reservation_id,
-                    PAYMENT_PROVIDER,
-                    provider_reference,
-                    amount_cents,
-                    currency,
-                    "voided",
-                    created_at,
-                ),
-            )
+            existing = connection.execute(
+                "SELECT * FROM payment_records WHERE provider = ? AND provider_reference = ?",
+                (PAYMENT_PROVIDER, provider_reference),
+            ).fetchone()
+
+            if amount_cents != reservation["total_cents"] or currency != reservation["currency"]:
+                if existing is None:
+                    assert_payment_transition(None, "voided", amount_cents=amount_cents)
+                    connection.execute(
+                        """
+                        INSERT INTO payment_records
+                        (id, reservation_id, provider, provider_reference, amount_cents, currency, status, created_at, failure_message)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            f"pay_{provider_reference}",
+                            reservation_id,
+                            PAYMENT_PROVIDER,
+                            provider_reference,
+                            amount_cents,
+                            currency,
+                            "voided",
+                            created_at,
+                            "Payment amount or currency did not match the reservation total.",
+                        ),
+                    )
+                    record_audit_event(
+                        connection,
+                        actor=system_actor("webhook"),
+                        event_type="payment.failed",
+                        entity_type="payment",
+                        entity_id=f"pay_{provider_reference}",
+                        metadata={
+                            "reservationId": reservation_id,
+                            "provider": PAYMENT_PROVIDER,
+                            "amountCents": amount_cents,
+                            "currency": currency,
+                            "failureReason": "amount_or_currency_mismatch",
+                            "auditWritePolicy": "best effort; payment correctness wins",
+                        },
+                        created_at=created_at,
+                    )
+                    connection.commit()
+                else:
+                    connection.rollback()
+                raise BookingValidationError("Payment amount or currency does not match reservation total.")
+
+            if existing is not None and existing["status"] == status:
+                connection.rollback()
+                return {"duplicate": True, "paymentId": existing["id"], "status": existing["status"]}
+
+            if status == "captured":
+                assert_reservation_transition(reservation["status"], "confirmed", via="payment_webhook")
+            elif reservation["status"] != "pending_payment":
+                raise BookingConflict(f"Payment event {event_type} is invalid for {reservation['status']} reservation.")
+
+            safe_failure_message = _safe_payment_failure_message(status, failure_message)
+            if existing is not None:
+                current_payment_status = existing["status"]
+                if current_payment_status == "refunded":
+                    current_payment_status = "captured"
+                assert_payment_transition(current_payment_status, status, amount_cents=amount_cents)
+                connection.execute(
+                    "UPDATE payment_records SET status = ?, amount_cents = ?, currency = ?, failure_message = ? WHERE id = ?",
+                    (status, amount_cents, currency, safe_failure_message, existing["id"]),
+                )
+                payment_id = existing["id"]
+            else:
+                prior_payment = connection.execute(
+                    """
+                    SELECT * FROM payment_records
+                    WHERE reservation_id = ? AND status IN ('authorized', 'captured', 'refunded')
+                    ORDER BY created_at DESC
+                    LIMIT 1
+                    """,
+                    (reservation_id,),
+                ).fetchone()
+                current_payment_status = prior_payment["status"] if prior_payment is not None else None
+                if current_payment_status == "refunded":
+                    current_payment_status = "captured"
+                assert_payment_transition(current_payment_status, status, amount_cents=amount_cents)
+                payment_id = f"pay_{provider_reference}"
+                connection.execute(
+                    """
+                    INSERT INTO payment_records
+                    (id, reservation_id, provider, provider_reference, amount_cents, currency, status, created_at, failure_message)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        payment_id,
+                        reservation_id,
+                        PAYMENT_PROVIDER,
+                        provider_reference,
+                        amount_cents,
+                        currency,
+                        status,
+                        created_at,
+                        safe_failure_message,
+                    ),
+                )
+
+            if status == "captured":
+                connection.execute(
+                    "UPDATE reservations SET status = 'confirmed', expires_at = NULL WHERE id = ?",
+                    (reservation_id,),
+                )
+                record_audit_event(
+                    connection,
+                    actor=system_actor("webhook"),
+                    event_type="reservation.confirmed",
+                    entity_type="reservation",
+                    entity_id=reservation_id,
+                    metadata={"paymentId": payment_id, "auditWritePolicy": "best effort; payment correctness wins"},
+                    created_at=created_at,
+                )
             record_audit_event(
                 connection,
                 actor=system_actor("webhook"),
-                event_type="payment.failed",
+                event_type=event_type,
                 entity_type="payment",
-                entity_id=f"pay_{provider_reference}",
+                entity_id=payment_id,
                 metadata={
                     "reservationId": reservation_id,
                     "provider": PAYMENT_PROVIDER,
                     "amountCents": amount_cents,
                     "currency": currency,
-                    "failureReason": "amount_or_currency_mismatch",
+                    "status": status,
                     "auditWritePolicy": "best effort; payment correctness wins",
                 },
                 created_at=created_at,
             )
             connection.commit()
-            raise BookingValidationError("Payment amount or currency does not match reservation total.")
-
-        status = "captured" if event_type == "payment.succeeded" else "voided"
-        connection.execute(
-            """
-            INSERT INTO payment_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                f"pay_{provider_reference}",
-                reservation_id,
-                PAYMENT_PROVIDER,
-                provider_reference,
-                amount_cents,
-                currency,
-                status,
-                created_at,
-            ),
-        )
-        if status == "captured":
-            connection.execute(
-                "UPDATE reservations SET status = 'confirmed', expires_at = NULL WHERE id = ?",
-                (reservation_id,),
-            )
-            record_audit_event(
-                connection,
-                actor=system_actor("webhook"),
-                event_type="reservation.confirmed",
-                entity_type="reservation",
-                entity_id=reservation_id,
-                metadata={"paymentId": f"pay_{provider_reference}", "auditWritePolicy": "best effort; payment correctness wins"},
-                created_at=created_at,
-            )
-        record_audit_event(
-            connection,
-            actor=system_actor("webhook"),
-            event_type="payment.succeeded" if status == "captured" else "payment.failed",
-            entity_type="payment",
-            entity_id=f"pay_{provider_reference}",
-            metadata={
-                "reservationId": reservation_id,
-                "provider": PAYMENT_PROVIDER,
-                "amountCents": amount_cents,
-                "currency": currency,
-                "status": status,
-                "auditWritePolicy": "best effort; payment correctness wins",
-            },
-            created_at=created_at,
-        )
-        connection.commit()
-        return {"duplicate": False, "paymentId": f"pay_{provider_reference}", "status": status}
+            return {"duplicate": False, "paymentId": payment_id, "status": status}
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
 
 
 def get_reservation_for_user(database_path: str, reservation_id: str, user_id: str) -> dict[str, Any]:
@@ -346,6 +461,42 @@ def get_reservation_for_user(database_path: str, reservation_id: str, user_id: s
         if not canViewReservation(actor, row) or actor is None or actor["role"] == "admin":
             raise PermissionError("Reservation access denied.")
         return guest_reservation_dto(row)
+
+
+def complete_reservation_stay(
+    database_path: str,
+    reservation_id: str,
+    *,
+    today: str,
+    completed_at: str | None = None,
+) -> dict[str, Any]:
+    """Mark a confirmed reservation completed after the stay has passed by date-only rules."""
+
+    with _connect(database_path) as connection:
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+            row = _reservation_by_id(connection, reservation_id)
+            if row is None:
+                raise LookupError("Reservation not found.")
+            assert_stay_completed(row["check_out"], today=today)
+            assert_reservation_transition(row["status"], "completed", via="completion_service")
+            connection.execute("UPDATE reservations SET status = 'completed' WHERE id = ?", (reservation_id,))
+            record_audit_event(
+                connection,
+                actor=system_actor(),
+                event_type="reservation.completed",
+                entity_type="reservation",
+                entity_id=reservation_id,
+                metadata={"auditWritePolicy": "best effort; completion correctness wins"},
+                created_at=completed_at or f"{today}T00:00:00Z",
+            )
+            connection.commit()
+            completed = _reservation_by_id(connection, reservation_id)
+            return guest_reservation_dto(completed)
+        except Exception:
+            if connection.in_transaction:
+                connection.rollback()
+            raise
 
 
 def lookup_guest_reservation(database_path: str, reservation_id: str, confirmation_secret: str) -> dict[str, Any]:
@@ -380,6 +531,7 @@ def cancel_reservation(
                 raise BookingConflict("Reservation is not eligible for cancellation.")
             if not canCancelReservation(actor, row):
                 raise PermissionError("Reservation cancellation denied.")
+            assert_reservation_transition(row["status"], "cancelled", via="cancellation_service")
 
             connection.execute(
                 "UPDATE reservations SET status = 'cancelled', cancelled_at = ? WHERE id = ?",
@@ -396,6 +548,20 @@ def cancel_reservation(
                 (reservation_id,),
             ).fetchone()
             if payment is not None:
+                refunded_cents = connection.execute(
+                    """
+                    SELECT COALESCE(SUM(amount_cents), 0) FROM refunds
+                    WHERE payment_record_id = ? AND status = 'succeeded'
+                    """,
+                    (payment["id"],),
+                ).fetchone()[0]
+                assert_payment_transition(
+                    "captured",
+                    "refunded",
+                    amount_cents=payment["amount_cents"],
+                    captured_cents=payment["amount_cents"],
+                    refunded_cents=refunded_cents,
+                )
                 refund_id = f"ref_{payment['id']}"
                 connection.execute(
                     "INSERT INTO refunds VALUES (?, ?, ?, ?, ?, ?)",
@@ -456,12 +622,21 @@ def create_payment_intent(
                 raise LookupError("Reservation not found.")
             if not canPayReservation(actor, reservation):
                 raise PermissionError("Payment access denied.")
+            prior_payment = connection.execute(
+                "SELECT * FROM payment_records WHERE reservation_id = ? AND status IN ('authorized', 'captured', 'refunded') ORDER BY created_at DESC LIMIT 1",
+                (reservation_id,),
+            ).fetchone()
+            assert_payment_transition(prior_payment["status"] if prior_payment is not None else None, "authorized", amount_cents=reservation["total_cents"])
             existing = connection.execute("SELECT * FROM payment_records WHERE id = ?", (payment_id,)).fetchone()
             if existing is not None:
                 connection.rollback()
                 return payment_safe_dto(existing)
             connection.execute(
-                "INSERT INTO payment_records VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                """
+                INSERT INTO payment_records
+                (id, reservation_id, provider, provider_reference, amount_cents, currency, status, created_at, failure_message)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
                 (
                     payment_id,
                     reservation_id,
@@ -471,6 +646,7 @@ def create_payment_intent(
                     reservation["currency"],
                     "authorized",
                     created_at,
+                    None,
                 ),
             )
             record_audit_event(
@@ -496,6 +672,129 @@ def create_payment_intent(
                 connection.rollback()
             raise
 
+
+
+class FixturePaymentProvider:
+    """Deterministic provider abstraction that returns only client-safe values."""
+
+    provider = PAYMENT_PROVIDER
+
+    def create_intent(self, *, reservation_id: str, amount_cents: int, currency: str) -> dict[str, Any]:
+        provider_reference = f"fx_intent_{reservation_id}"
+        return {
+            "provider": self.provider,
+            "providerReference": provider_reference,
+            "clientSecret": f"cs_test_{provider_reference}",
+            "amount": format_money(amount_cents, currency),
+        }
+
+    def event_for_confirmation(self, *, provider_reference: str, outcome: str) -> dict[str, str]:
+        events = {
+            "succeeded": "payment.succeeded",
+            "failed": "payment.failed",
+            "requires_payment_method": "payment.failed",
+        }
+        return {"providerReference": provider_reference, "eventType": events.get(outcome, outcome)}
+
+
+def _safe_payment_failure_message(status: str, failure_message: str | None) -> str | None:
+    if status != "voided":
+        return None
+    if failure_message and 0 < len(failure_message) <= 160:
+        lowered = failure_message.lower()
+        sensitive_terms = ("card", "cvc", "cvv", "pan", "secret", "token")
+        if not any(term in lowered for term in sensitive_terms):
+            return failure_message
+    return "Payment was not authorized. Please try another payment method."
+
+
+def _payment_client_payload(row: sqlite3.Row, *, client_secret: str | None = None) -> dict[str, Any]:
+    payload = payment_safe_dto(row)
+    payload["client"] = {"clientSecret": client_secret} if client_secret else {}
+    return payload
+
+
+def create_payment_authorization(
+    database_path: str,
+    *,
+    reservation_id: str,
+    user_id: str,
+    amount_cents: int,
+    currency: str = "USD",
+    created_at: str = "2031-04-01T10:03:00Z",
+    provider: FixturePaymentProvider | None = None,
+) -> dict[str, Any]:
+    """Create a provider-backed payment intent only for a pending reservation total."""
+
+    provider = provider or FixturePaymentProvider()
+    with _connect(database_path) as connection:
+        reservation = _reservation_by_id(connection, reservation_id)
+        actor = _actor_by_id(connection, user_id)
+        if reservation is None:
+            raise LookupError("Reservation not found.")
+        if not canPayReservation(actor, reservation):
+            raise PermissionError("Payment access denied.")
+        if reservation["expires_at"] is not None and created_at > reservation["expires_at"]:
+            raise BookingConflict("Reservation payment window has expired.")
+        if amount_cents != reservation["total_cents"] or currency != reservation["currency"]:
+            raise BookingValidationError("Payment amount or currency does not match reservation total.")
+        provider_intent = provider.create_intent(
+            reservation_id=reservation_id,
+            amount_cents=reservation["total_cents"],
+            currency=reservation["currency"],
+        )
+
+    payment = create_payment_intent(
+        database_path,
+        payment_id=f"pay_{provider_intent['providerReference']}",
+        reservation_id=reservation_id,
+        user_id=user_id,
+        provider_reference=provider_intent["providerReference"],
+        created_at=created_at,
+    )
+    with _connect(database_path) as connection:
+        row = connection.execute("SELECT * FROM payment_records WHERE id = ?", (payment["id"],)).fetchone()
+        return _payment_client_payload(row, client_secret=provider_intent["clientSecret"])
+
+
+def confirm_payment_authorization(
+    database_path: str,
+    *,
+    reservation_id: str,
+    user_id: str,
+    provider_reference: str,
+    amount_cents: int,
+    currency: str = "USD",
+    outcome: str = "succeeded",
+    failure_message: str | None = None,
+    confirmed_at: str = "2031-04-01T10:05:00Z",
+    provider: FixturePaymentProvider | None = None,
+) -> dict[str, Any]:
+    """Confirm or reconcile a provider payment status for an owned reservation."""
+
+    provider = provider or FixturePaymentProvider()
+    with _connect(database_path) as connection:
+        reservation = _reservation_by_id(connection, reservation_id)
+        actor = _actor_by_id(connection, user_id)
+        if reservation is None:
+            raise LookupError("Reservation not found.")
+        if actor is None or not canViewReservation(actor, reservation) or actor["role"] == "admin":
+            raise PermissionError("Payment access denied.")
+    provider_event = provider.event_for_confirmation(provider_reference=provider_reference, outcome=outcome)
+    result = record_payment_webhook(
+        database_path,
+        provider_reference=provider_event["providerReference"],
+        reservation_id=reservation_id,
+        amount_cents=amount_cents,
+        currency=currency,
+        event_type=provider_event["eventType"],
+        created_at=confirmed_at,
+        failure_message=failure_message,
+    )
+    with _connect(database_path) as connection:
+        payment = connection.execute("SELECT * FROM payment_records WHERE id = ?", (result["paymentId"],)).fetchone()
+        reservation = _reservation_by_id(connection, reservation_id)
+        return {"duplicate": result["duplicate"], "payment": payment_safe_dto(payment), "reservation": guest_reservation_dto(reservation)}
 
 def admin_update_hotel(
     database_path: str,
@@ -747,20 +1046,76 @@ def booking_api_get_guest_reservation(database_path: str, reservation_id: str, c
         return error_response(404, "not_found", "Reservation not found.")
 
 
-def booking_api_record_payment(database_path: str, payload: dict[str, Any], user_id: str) -> ApiResponse:
-    """HTTP-shaped payment adapter that authorizes caller and hides provider secrets."""
+def booking_api_create_payment_intent(database_path: str, payload: dict[str, Any], user_id: str) -> ApiResponse:
+    """POST /api/payments/create-intent adapter returning only safe provider client data."""
+
+    required = ["reservationId", "amountCents"]
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
+    try:
+        payment = create_payment_authorization(
+            database_path,
+            reservation_id=payload["reservationId"],
+            user_id=user_id,
+            amount_cents=int(payload["amountCents"]),
+            currency=payload.get("currency", "USD"),
+            created_at=payload.get("createdAt", "2031-04-01T10:03:00Z"),
+        )
+        return success_response({"payment": payment}, status_code=201)
+    except PermissionError:
+        return error_response(403, "forbidden", "You are not authorized to pay for this reservation.")
+    except LookupError as exc:
+        return error_response(404, "not_found", str(exc))
+    except BookingValidationError:
+        return error_response(400, "validation_error", "Payment could not be processed.")
+    except BookingConflict as exc:
+        return error_response(409, "payment_conflict", str(exc))
+
+
+def booking_api_confirm_payment(database_path: str, payload: dict[str, Any], user_id: str) -> ApiResponse:
+    """POST /api/payments/confirm adapter for client redirects and reconciliation."""
 
     required = ["reservationId", "providerReference", "amountCents"]
     missing = [field for field in required if field not in payload]
     if missing:
         return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
-    with _connect(database_path) as connection:
-        reservation = _reservation_by_id(connection, payload["reservationId"])
-        actor = _actor_by_id(connection, user_id)
-        if reservation is None:
-            return error_response(404, "not_found", "Reservation not found.")
-        if not canPayReservation(actor, reservation):
-            return error_response(403, "forbidden", "You are not authorized to pay for this reservation.")
+    try:
+        result = confirm_payment_authorization(
+            database_path,
+            reservation_id=payload["reservationId"],
+            user_id=user_id,
+            provider_reference=payload["providerReference"],
+            amount_cents=int(payload["amountCents"]),
+            currency=payload.get("currency", "USD"),
+            outcome=payload.get("outcome", "succeeded"),
+            failure_message=payload.get("failureMessage"),
+            confirmed_at=payload.get("confirmedAt", "2031-04-01T10:05:00Z"),
+        )
+        return success_response(result, status_code=200 if result["duplicate"] else 201)
+    except PermissionError:
+        return error_response(403, "forbidden", "You are not authorized to pay for this reservation.")
+    except LookupError as exc:
+        return error_response(404, "not_found", str(exc))
+    except BookingValidationError:
+        return error_response(400, "validation_error", "Payment could not be processed.")
+    except BookingConflict as exc:
+        return error_response(409, "payment_conflict", str(exc))
+
+
+def booking_api_record_payment(database_path: str, payload: dict[str, Any], user_id: str) -> ApiResponse:
+    """Backward-compatible payment adapter that authorizes caller and hides provider secrets."""
+
+    return booking_api_confirm_payment(database_path, {**payload, "outcome": payload.get("eventType", "payment.succeeded")}, user_id)
+
+
+def booking_api_handle_provider_event(database_path: str, payload: dict[str, Any]) -> ApiResponse:
+    """Provider event handler for asynchronous webhook-style payment events."""
+
+    required = ["reservationId", "providerReference", "amountCents", "eventType"]
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
     try:
         result = record_payment_webhook(
             database_path,
@@ -768,13 +1123,21 @@ def booking_api_record_payment(database_path: str, payload: dict[str, Any], user
             reservation_id=payload["reservationId"],
             amount_cents=int(payload["amountCents"]),
             currency=payload.get("currency", "USD"),
-            event_type=payload.get("eventType", "payment.succeeded"),
+            event_type=payload["eventType"],
+            created_at=payload.get("createdAt", "2031-04-01T10:05:00Z"),
+            failure_message=payload.get("failureMessage"),
         )
     except BookingValidationError:
         return error_response(400, "validation_error", "Payment could not be processed.")
+    except BookingConflict as exc:
+        return error_response(409, "payment_conflict", str(exc))
     with _connect(database_path) as connection:
         payment = connection.execute("SELECT * FROM payment_records WHERE id = ?", (result["paymentId"],)).fetchone()
-        return success_response({"duplicate": result["duplicate"], "payment": payment_safe_dto(payment)}, status_code=200 if result["duplicate"] else 201)
+        reservation = _reservation_by_id(connection, payload["reservationId"])
+        return success_response(
+            {"duplicate": result["duplicate"], "payment": payment_safe_dto(payment), "reservation": guest_reservation_dto(reservation)},
+            status_code=200 if result["duplicate"] else 201,
+        )
 
 
 def booking_api_admin_get_reservation(database_path: str, reservation_id: str, user_id: str) -> ApiResponse:

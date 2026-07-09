@@ -7,6 +7,7 @@ from hbw_seed.audit import record_audit_event, sanitize_metadata, system_actor
 from hbw_seed.booking import (
     BookingConflict,
     BookingValidationError,
+    assert_payment_transition,
     admin_create_availability_block,
     admin_delete_availability_block,
     admin_update_hotel,
@@ -15,6 +16,8 @@ from hbw_seed.booking import (
     available_room_ids,
     booking_api_cancel_reservation,
     booking_api_create_reservation,
+    booking_api_create_payment_intent,
+    booking_api_confirm_payment,
     booking_api_admin_get_reservation,
     booking_api_get_guest_reservation,
     booking_api_get_reservation,
@@ -22,6 +25,7 @@ from hbw_seed.booking import (
     calculate_total_cents,
     create_payment_intent,
     cancel_reservation,
+    complete_reservation_stay,
     create_pending_reservation,
     expire_pending_reservation,
     format_money,
@@ -30,7 +34,7 @@ from hbw_seed.booking import (
     record_payment_webhook,
     validate_occupancy,
 )
-from hbw_seed.public_api import handle_get
+from hbw_seed.public_api import handle_get, handle_post
 
 
 def seeded_database(tmp_path):
@@ -256,6 +260,56 @@ def test_integration_availability_supports_back_to_back_and_filters_overlaps(tmp
         ]
 
 
+def test_back_to_back_inventory_recalculation_after_cancel_and_expire(tmp_path):
+    database = seeded_database(tmp_path)
+    first = create_pending_reservation(
+        str(database),
+        reservation_id="res_recalc_first",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+    second = create_pending_reservation(
+        str(database),
+        reservation_id="res_recalc_back_to_back",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-14",
+        check_out="2031-06-16",
+        adults=2,
+        children=1,
+    )
+    record_payment_webhook(str(database), provider_reference="fx_recalc_first", reservation_id=first["id"], amount_cents=first["total"]["amountCents"])
+
+    with sqlite3.connect(database) as connection:
+        assert first["status"] == "pending_payment"
+        assert second["status"] == "pending_payment"
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-12", "2031-06-14") == ["room_garden_family_302"]
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-14", "2031-06-16") == ["room_garden_family_302"]
+
+    cancel_reservation(str(database), reservation_id=first["id"], user_id="usr_guest")
+    expire_pending_reservation(str(database), second["id"], now="2031-06-10T00:00:00Z")
+
+    with sqlite3.connect(database) as connection:
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-12", "2031-06-14") == [
+            "room_garden_family_301",
+            "room_garden_family_302",
+        ]
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-14", "2031-06-16") == [
+            "room_garden_family_301",
+            "room_garden_family_302",
+        ]
+
+
 def test_reservation_creation_is_transactional_for_last_room_and_duplicate_request(tmp_path):
     database = seeded_database(tmp_path)
 
@@ -320,6 +374,7 @@ def test_expired_pending_reservation_releases_inventory(tmp_path):
     database = seeded_database(tmp_path)
 
     assert expire_pending_reservation(str(database), "res_garden_family_pending", now="2031-06-10T00:00:00Z") is True
+    assert expire_pending_reservation(str(database), "res_garden_family_pending", now="2031-06-10T00:01:00Z") is False
     with sqlite3.connect(database) as connection:
         assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-10", "2031-06-12") == [
             "room_garden_family_301",
@@ -327,6 +382,28 @@ def test_expired_pending_reservation_releases_inventory(tmp_path):
         ]
         status = connection.execute("SELECT status FROM reservations WHERE id = 'res_garden_family_pending'").fetchone()[0]
     assert status == "expired"
+
+
+def test_payment_after_expiration_is_rejected_and_released_inventory_remains_available(tmp_path):
+    database = seeded_database(tmp_path)
+
+    assert expire_pending_reservation(str(database), "res_garden_family_pending", now="2031-06-10T00:00:00Z") is True
+    conflict = assert_raises(
+        BookingConflict,
+        record_payment_webhook,
+        str(database),
+        provider_reference="fx_after_expiration",
+        reservation_id="res_garden_family_pending",
+        amount_cents=52000,
+    )
+
+    assert str(conflict) == "Reservation cannot transition from expired to confirmed via payment_webhook."
+    with sqlite3.connect(database) as connection:
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-10", "2031-06-12") == [
+            "room_garden_family_301",
+            "room_garden_family_302",
+        ]
+        assert connection.execute("SELECT COUNT(*) FROM payment_records WHERE provider_reference = 'fx_after_expiration'").fetchone()[0] == 0
 
 
 def test_payment_success_failure_duplicate_webhook_and_amount_mismatch(tmp_path):
@@ -379,6 +456,58 @@ def test_payment_success_failure_duplicate_webhook_and_amount_mismatch(tmp_path)
     assert payment_statuses == [("fx_amount_mismatch", "voided"), ("fx_success_payment_flow", "captured")]
 
 
+def test_invalid_payment_transitions_do_not_mark_captured_payment_failed(tmp_path):
+    database = seeded_database(tmp_path)
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_invalid_payment_transition",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+    record_payment_webhook(
+        str(database),
+        provider_reference="fx_invalid_transition_success",
+        reservation_id=reservation["id"],
+        amount_cents=reservation["total"]["amountCents"],
+    )
+
+    conflict = assert_raises(
+        BookingConflict,
+        record_payment_webhook,
+        str(database),
+        provider_reference="fx_invalid_transition_failure",
+        reservation_id=reservation["id"],
+        amount_cents=reservation["total"]["amountCents"],
+        event_type="payment.failed",
+    )
+
+    assert str(conflict) == "Payment event payment.failed is invalid for confirmed reservation."
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT status FROM reservations WHERE id = ?", (reservation["id"],)).fetchone()[0] == "confirmed"
+        assert connection.execute("SELECT COUNT(*) FROM payment_records WHERE provider_reference = 'fx_invalid_transition_failure'").fetchone()[0] == 0
+
+
+def test_refund_limits_reject_refunding_more_than_captured_amount():
+    assert str(
+        assert_raises(
+            BookingConflict,
+            assert_payment_transition,
+            "captured",
+            "refunded",
+            amount_cents=101,
+            captured_cents=100,
+            refunded_cents=0,
+        )
+    ) == "Refund amount cannot exceed captured payment amount."
+
+
 def test_cancellation_refunds_payment_and_releases_inventory(tmp_path):
     database = seeded_database(tmp_path)
     reservation = create_pending_reservation(
@@ -413,6 +542,26 @@ def test_cancellation_refunds_payment_and_releases_inventory(tmp_path):
         assert "room_garden_family_302" in available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-12", "2031-06-14")
         payment_status = connection.execute("SELECT status FROM payment_records WHERE provider_reference = 'fx_cancel_flow'").fetchone()[0]
     assert payment_status == "refunded"
+    assert str(assert_raises(BookingConflict, cancel_reservation, str(database), reservation_id=reservation["id"], user_id="usr_guest")) == "Reservation is not eligible for cancellation."
+
+
+def test_completed_reservation_is_displayed_but_not_guest_cancellable(tmp_path):
+    database = seeded_database(tmp_path)
+
+    completed = complete_reservation_stay(str(database), "res_bay_king_auth_confirmed", today="2031-06-13")
+    viewed = get_reservation_for_user(str(database), "res_bay_king_auth_confirmed", "usr_guest")
+
+    assert completed["status"] == "completed"
+    assert viewed["status"] == "completed"
+    assert str(assert_raises(BookingConflict, cancel_reservation, str(database), reservation_id="res_bay_king_auth_confirmed", user_id="usr_guest")) == "Reservation is not eligible for cancellation."
+    assert str(assert_raises(BookingConflict, complete_reservation_stay, str(database), "res_bay_king_auth_confirmed", today="2031-06-14")) == "Reservation cannot transition from completed to completed via completion_service."
+
+
+def test_completion_uses_date_only_rules(tmp_path):
+    database = seeded_database(tmp_path)
+
+    assert str(assert_raises(BookingConflict, complete_reservation_stay, str(database), "res_bay_king_auth_confirmed", today="2031-06-12")) == "Reservation stay has not passed date-only completion rules."
+
 
 
 def test_authorization_prevents_viewing_or_cancelling_another_users_booking(tmp_path):
@@ -575,6 +724,186 @@ def test_guest_confirmation_lookup_requires_non_guessable_secret(tmp_path):
     assert valid.body["data"]["id"] == "res_bay_king_guest_confirmed"
     assert "roomId" not in valid.body["data"]
     assert "userId" not in valid.body["data"]
+
+
+def test_payment_intent_endpoint_requires_pending_matching_reservation_and_returns_safe_client_data(tmp_path):
+    database = seeded_database(tmp_path)
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_intent_endpoint",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+
+    mismatch = booking_api_create_payment_intent(
+        str(database),
+        {"reservationId": reservation["id"], "amountCents": reservation["total"]["amountCents"] + 1},
+        "usr_guest",
+    )
+    intent = handle_post(
+        str(database),
+        "/api/payments/create-intent",
+        {"reservationId": reservation["id"], "amountCents": reservation["total"]["amountCents"]},
+        "usr_guest",
+    )
+    duplicate = booking_api_create_payment_intent(
+        str(database),
+        {"reservationId": reservation["id"], "amountCents": reservation["total"]["amountCents"]},
+        "usr_guest",
+    )
+
+    assert mismatch.status_code == 400
+    assert intent.status_code == 201
+    payment = intent.body["data"]["payment"]
+    assert payment["status"] == "authorized"
+    assert payment["client"] == {"clientSecret": "cs_test_fx_intent_res_intent_endpoint"}
+    assert "providerReference" not in payment
+    assert "providerSecret" not in payment
+    assert "cardNumber" not in str(intent.body)
+    assert duplicate.status_code == 409
+    assert duplicate.body["error"]["code"] == "payment_conflict"
+
+
+def test_payment_confirm_endpoint_success_failure_duplicate_and_retry_after_failure(tmp_path):
+    database = seeded_database(tmp_path)
+    failing_reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_confirm_failure_retry",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+    failed_intent = booking_api_create_payment_intent(
+        str(database),
+        {"reservationId": failing_reservation["id"], "amountCents": failing_reservation["total"]["amountCents"]},
+        "usr_guest",
+    )
+    failed = booking_api_confirm_payment(
+        str(database),
+        {
+            "reservationId": failing_reservation["id"],
+            "providerReference": "fx_intent_res_confirm_failure_retry",
+            "amountCents": failing_reservation["total"]["amountCents"],
+            "outcome": "failed",
+            "failureMessage": "Issuer declined payment.",
+        },
+        "usr_guest",
+    )
+    retry = booking_api_create_payment_intent(
+        str(database),
+        {"reservationId": failing_reservation["id"], "amountCents": failing_reservation["total"]["amountCents"]},
+        "usr_guest",
+    )
+
+    assert failed_intent.status_code == 201
+    assert failed.status_code == 201
+    assert failed.body["data"]["payment"]["status"] == "voided"
+    assert failed.body["data"]["payment"]["failureMessage"] == "Issuer declined payment."
+    assert failed.body["data"]["reservation"]["status"] == "pending_payment"
+    assert retry.status_code == 201
+
+    successful_reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_confirm_success_duplicate",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-14",
+        check_out="2031-06-16",
+        adults=2,
+        children=1,
+    )
+    booking_api_create_payment_intent(
+        str(database),
+        {"reservationId": successful_reservation["id"], "amountCents": successful_reservation["total"]["amountCents"]},
+        "usr_guest",
+    )
+    success = handle_post(
+        str(database),
+        "/api/payments/confirm",
+        {
+            "reservationId": successful_reservation["id"],
+            "providerReference": "fx_intent_res_confirm_success_duplicate",
+            "amountCents": successful_reservation["total"]["amountCents"],
+        },
+        "usr_guest",
+    )
+    duplicate = handle_post(
+        str(database),
+        "/api/payments/provider-events",
+        {
+            "reservationId": successful_reservation["id"],
+            "providerReference": "fx_intent_res_confirm_success_duplicate",
+            "amountCents": successful_reservation["total"]["amountCents"],
+            "eventType": "payment.succeeded",
+        },
+    )
+
+    assert success.status_code == 201
+    assert success.body["data"]["payment"]["status"] == "captured"
+    assert success.body["data"]["reservation"]["status"] == "confirmed"
+    assert duplicate.status_code == 200
+    assert duplicate.body["data"]["duplicate"] is True
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM payment_records WHERE provider_reference = 'fx_intent_res_confirm_success_duplicate'").fetchone()[0] == 1
+
+
+def test_ineligible_reservations_cannot_create_payment_intents(tmp_path):
+    database = seeded_database(tmp_path)
+    expired = booking_api_create_payment_intent(
+        str(database),
+        {"reservationId": "res_garden_queen_expired", "amountCents": 36000},
+        "usr_guest",
+    )
+    confirmed = booking_api_create_payment_intent(
+        str(database),
+        {"reservationId": "res_bay_king_auth_confirmed", "amountCents": 48000},
+        "usr_guest",
+    )
+    cancelled = booking_api_create_payment_intent(
+        str(database),
+        {"reservationId": "res_bay_suite_cancelled", "amountCents": 84000},
+        "usr_guest",
+    )
+    pending = create_pending_reservation(
+        str(database),
+        reservation_id="res_intent_time_expired",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+    time_expired = booking_api_create_payment_intent(
+        str(database),
+        {"reservationId": pending["id"], "amountCents": pending["total"]["amountCents"], "createdAt": "2031-06-10T00:00:00Z"},
+        "usr_guest",
+    )
+
+    assert expired.status_code in {403, 409}
+    assert confirmed.status_code == 403
+    assert cancelled.status_code == 403
+    assert time_expired.status_code == 409
+    assert time_expired.body["error"]["message"] == "Reservation payment window has expired."
 
 
 def test_payment_api_authorizes_owner_and_hides_provider_reference(tmp_path):
