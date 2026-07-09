@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any
 
+from .audit import record_audit_event, user_actor
+
 PASSENGER_TYPES = {"adult", "child", "infant"}
 GENDERS = {"female", "male", "non_binary", "unspecified"}
 DOCUMENT_TYPES = {"passport", "national_id", "drivers_license", "known_traveler", "redress"}
@@ -112,6 +114,16 @@ class ProfileRepository:
                 """,
                 tuple(normalized.values()),
             )
+            record_audit_event(
+                connection,
+                actor=user_actor(normalized["user_id"]),
+                event_type="user.profile.created",
+                entity_type="user",
+                entity_id=normalized["user_id"],
+                user_id=normalized["user_id"],
+                metadata={"changedFields": sorted(normalized), "auditWritePolicy": "best effort; profile correctness wins"},
+                created_at="2031-04-01T08:00:00Z",
+            )
             connection.commit()
             return self._user_profile_row(connection, normalized["user_id"])
 
@@ -129,6 +141,16 @@ class ProfileRepository:
             if self._user_profile_row(connection, user_id) is None:
                 raise ProfileNotFoundError("User profile not found.")
             _update_table(connection, "user_profiles", "user_id", user_id, normalized)
+            record_audit_event(
+                connection,
+                actor=user_actor(user_id),
+                event_type="user.profile.updated",
+                entity_type="user",
+                entity_id=user_id,
+                user_id=user_id,
+                metadata={"changedFields": sorted(normalized), "auditWritePolicy": "best effort; profile correctness wins"},
+                created_at="2031-04-01T08:05:00Z",
+            )
             connection.commit()
             return self._user_profile_row(connection, user_id)
 

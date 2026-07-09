@@ -26,7 +26,8 @@ FIXTURE_DATES = {
 
 SCHEMA_STATEMENTS = [
     "PRAGMA foreign_keys = ON",
-    "DROP TABLE IF EXISTS audit_records",
+    "DROP VIEW IF EXISTS audit_records",
+    "DROP TABLE IF EXISTS audit_events",
     "DROP TABLE IF EXISTS refunds",
     "DROP TABLE IF EXISTS payment_records",
     "DROP TABLE IF EXISTS availability_blocks",
@@ -243,16 +244,41 @@ SCHEMA_STATEMENTS = [
     )
     """,
     """
-    CREATE TABLE audit_records (
+    CREATE TABLE audit_events (
         id TEXT PRIMARY KEY,
-        actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
-        actor_type TEXT NOT NULL CHECK (actor_type IN ('guest', 'admin', 'system', 'webhook')),
         event_type TEXT NOT NULL,
-        entity_type TEXT NOT NULL,
-        entity_id TEXT NOT NULL,
+        actor_type TEXT NOT NULL CHECK (actor_type IN ('user', 'system', 'provider')),
+        actor_user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        actor_provider TEXT,
+        resource_type TEXT NOT NULL CHECK (resource_type IN ('user', 'search', 'booking', 'payment', 'offer', 'hotel', 'room_type', 'room', 'availability_block', 'refund', 'seed_dataset')),
+        resource_id TEXT NOT NULL,
+        user_id TEXT REFERENCES users(id) ON DELETE SET NULL,
+        search_id TEXT,
+        booking_id TEXT REFERENCES reservations(id) ON DELETE SET NULL,
+        payment_id TEXT REFERENCES payment_records(id) ON DELETE SET NULL,
+        offer_id TEXT,
         metadata TEXT NOT NULL,
+        occurred_at TEXT NOT NULL,
         created_at TEXT NOT NULL
     )
+    """,
+    """
+    CREATE VIEW audit_records AS
+    SELECT
+        id,
+        event_type,
+        CASE resource_type WHEN 'booking' THEN 'reservation' ELSE resource_type END AS entity_type,
+        resource_id AS entity_id,
+        CASE
+            WHEN actor_type = 'provider' AND actor_provider = 'webhook' THEN 'webhook'
+            WHEN actor_type = 'user' AND actor_user_id = 'usr_admin' THEN 'admin'
+            WHEN actor_type = 'user' THEN 'guest'
+            ELSE actor_type
+        END AS actor_type,
+        actor_user_id,
+        metadata,
+        occurred_at AS created_at
+    FROM audit_events
     """,
 ]
 
@@ -409,10 +435,10 @@ REFUNDS = [
 ]
 
 AUDITS = [
-    ("aud_seed_run", "usr_admin", "admin", "seed.reset", "seed_dataset", "deterministic_hbw", '{"source":"NIR-510"}', "2031-03-01T00:00:00Z"),
-    ("aud_hotel_closure", "usr_admin", "admin", "availability_block.created", "availability_block", "blk_loft_hotel_closed", '{"scenario":"hotel-level closure","auditWritePolicy":"blocking for admin inventory mutations"}', "2031-03-01T00:01:00Z"),
-    ("aud_room_type_closure", "usr_admin", "admin", "availability_block.created", "availability_block", "blk_garden_queen_closed", '{"scenario":"room-type closure","auditWritePolicy":"blocking for admin inventory mutations"}', "2031-03-01T00:02:00Z"),
-    ("aud_refund", "usr_admin", "admin", "refund.created", "refund", "ref_bay_suite_cancelled", '{"scenario":"cancelled reservation refund","auditWritePolicy":"best effort; cancellation correctness wins"}', "2031-03-05T10:06:00Z"),
+    ("aud_seed_run", "seed.reset", "user", "usr_admin", None, "seed_dataset", "deterministic_hbw", None, None, None, None, None, '{"source":"NIR-510"}', "2031-03-01T00:00:00Z", "2031-03-01T00:00:00Z"),
+    ("aud_hotel_closure", "availability_block.created", "user", "usr_admin", None, "availability_block", "blk_loft_hotel_closed", None, None, None, None, None, '{"scenario":"hotel-level closure","auditWritePolicy":"blocking for admin inventory mutations"}', "2031-03-01T00:01:00Z", "2031-03-01T00:01:00Z"),
+    ("aud_room_type_closure", "availability_block.created", "user", "usr_admin", None, "availability_block", "blk_garden_queen_closed", None, None, None, None, None, '{"scenario":"room-type closure","auditWritePolicy":"blocking for admin inventory mutations"}', "2031-03-01T00:02:00Z", "2031-03-01T00:02:00Z"),
+    ("aud_refund", "refund.created", "user", "usr_admin", None, "refund", "ref_bay_suite_cancelled", "usr_guest", None, "res_bay_suite_cancelled", "pay_bay_suite_cancelled", None, '{"scenario":"cancelled reservation refund","auditWritePolicy":"best effort; cancellation correctness wins"}', "2031-03-05T10:06:00Z", "2031-03-05T10:06:00Z"),
 ]
 
 
@@ -457,7 +483,7 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
         _insert_many(connection, "availability_blocks", AVAILABILITY_BLOCKS)
         _insert_many(connection, "payment_records", PAYMENTS)
         _insert_many(connection, "refunds", REFUNDS)
-        _insert_many(connection, "audit_records", AUDITS)
+        _insert_many(connection, "audit_events", AUDITS)
         connection.commit()
 
         tables = [
@@ -475,7 +501,7 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
             "availability_blocks",
             "payment_records",
             "refunds",
-            "audit_records",
+            "audit_events",
         ]
         return {
             table: connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
