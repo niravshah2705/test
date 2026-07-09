@@ -119,6 +119,7 @@ KEY_PAGE_KEYS = (
     "hotel_detail",
     "booking_guest_details",
     "payment",
+    "flight_booking_review",
     "reservation_confirmation",
     "account_reservations",
     "cancellation",
@@ -132,6 +133,7 @@ _REQUIRED_STATES_BY_PAGE: dict[str, tuple[str, ...]] = {
     "hotel_detail": ("loading", "empty", "validation_error", "error", "not_found", "success", "retry"),
     "booking_guest_details": ("loading", "validation_error", "conflict", "error", "success", "retry"),
     "payment": ("loading", "validation_error", "payment_failure", "error", "success", "retry"),
+    "flight_booking_review": ("loading", "unchanged_price", "price_increased", "price_decreased", "unavailable_offer", "retryable_failure", "revalidating", "currency_mismatch", "material_change"),
     "reservation_confirmation": ("loading", "not_found", "forbidden", "error", "success", "retry"),
     "account_reservations": ("loading", "empty", "not_found", "forbidden", "error", "success", "retry"),
     "cancellation": ("loading", "validation_error", "conflict", "not_found", "forbidden", "error", "success", "retry"),
@@ -417,6 +419,22 @@ def _state_for(page_key: str, status: str) -> PageStateContract:
                 {"label": "Choose another room", "href": "/hotels#rooms", "variant": "secondary"},
             ),
         )
+    if page_key == "flight_booking_review" and status == "unchanged_price":
+        return PageStateContract(page_key, status, "Price confirmed", "The provider confirmed the selected fare and itinerary. Payment is now available.", actions=({"label": "Continue to payment", "href": "/payments", "variant": "primary"},))
+    if page_key == "flight_booking_review" and status == "price_increased":
+        return PageStateContract(page_key, status, "Price increased", "The latest fare is higher than the snapshot. Payment remains blocked until the traveler accepts the new price.", role="alert", actions=({"label": "Accept new price", "href": "/booking/review?action=accept_price", "variant": "primary"}, {"label": "Choose another offer", "href": "/search", "variant": "secondary"}))
+    if page_key == "flight_booking_review" and status == "price_decreased":
+        return PageStateContract(page_key, status, "Price decreased", "The latest fare is lower than the snapshot. Accept the updated price before continuing to payment.", actions=({"label": "Accept new price", "href": "/booking/review?action=accept_price", "variant": "primary"},))
+    if page_key == "flight_booking_review" and status == "unavailable_offer":
+        return PageStateContract(page_key, status, "Offer no longer available", "The provider no longer has this fare available. Choose another offer before booking.", role="alert", actions=({"label": "Choose another offer", "href": "/search", "variant": "primary"},))
+    if page_key == "flight_booking_review" and status == "retryable_failure":
+        return PageStateContract(page_key, status, "Price check could not finish", "The provider timed out or returned a retryable error. The draft is unchanged and payment is still blocked.", role="alert", actions=({"label": "Retry price check", "href": "/booking/review?action=revalidate", "variant": "primary"},))
+    if page_key == "flight_booking_review" and status == "revalidating":
+        return PageStateContract(page_key, status, "Checking latest price", "A price check is already running. Refreshing this page will show the same in-progress state instead of starting duplicate payment.")
+    if page_key == "flight_booking_review" and status == "currency_mismatch":
+        return PageStateContract(page_key, status, "Currency changed", "The provider returned a different currency than the booking snapshot. Choose another offer before booking.", role="alert", actions=({"label": "Choose another offer", "href": "/search", "variant": "primary"},))
+    if page_key == "flight_booking_review" and status == "material_change":
+        return PageStateContract(page_key, status, "Flight details changed", "A material itinerary or flight-detail change was detected. Choose another offer before booking.", role="alert", actions=({"label": "Choose another offer", "href": "/search", "variant": "primary"},))
     if status == "not_found":
         return PageStateContract(page_key, status, "Page or reservation not found", "The requested resource could not be found. Use search or your account page to continue.", role="alert", actions=({"label": "Go to search", "href": "/search", "variant": "primary"},))
     if status == "forbidden":

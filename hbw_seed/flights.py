@@ -193,7 +193,7 @@ class FlightProvider(Protocol):
     def getOfferDetails(self, offer_id: str) -> dict[str, Any]:
         ...
 
-    def revalidateOffer(self, offer_id: str, *, scenario: str = "success") -> dict[str, Any]:
+    def revalidateOffer(self, offer_id: str, *, passengers: tuple[dict[str, Any], ...] = (), scenario: str = "success") -> dict[str, Any]:
         ...
 
     def createOrder(self, request: FlightOrderRequest) -> dict[str, Any]:
@@ -215,8 +215,8 @@ class FlightBookingService:
     def getOfferDetails(self, offer_id: str) -> FlightOffer:
         return map_provider_offer(self.provider.getOfferDetails(offer_id))
 
-    def revalidateOffer(self, offer_id: str, *, scenario: str = "success") -> RevalidationResult:
-        raw = self.provider.revalidateOffer(offer_id, scenario=scenario)
+    def revalidateOffer(self, offer_id: str, *, passengers: tuple[dict[str, Any], ...] = (), scenario: str = "success") -> RevalidationResult:
+        raw = self.provider.revalidateOffer(offer_id, passengers=passengers, scenario=scenario)
         status = raw["status"]
         if status == "unavailable":
             return RevalidationResult(status="unavailable", message=raw.get("message"))
@@ -256,7 +256,7 @@ class DeterministicMockFlightProvider:
             raise FlightProviderUnavailable("Mock provider could not retrieve offer details.")
         return _offer_payload(offer_id, _default_request())
 
-    def revalidateOffer(self, offer_id: str, *, scenario: str = "success") -> dict[str, Any]:
+    def revalidateOffer(self, offer_id: str, *, passengers: tuple[dict[str, Any], ...] = (), scenario: str = "success") -> dict[str, Any]:
         if scenario == "timeout":
             raise FlightProviderTimeout("Mock provider timed out while revalidating offer.")
         if scenario == "error":
@@ -265,6 +265,24 @@ class DeterministicMockFlightProvider:
             return {"status": "unavailable", "offer": None, "message": "Offer is no longer available."}
 
         offer = _offer_payload(offer_id, _default_request())
+        if scenario == "currency_mismatch":
+            offer = dict(offer)
+            offer["pricing"] = dict(offer["pricing"])
+            offer["pricing"]["total"] = {"amount": offer["pricing"]["total"]["amount"], "currency": "EUR"}
+            return {"status": "available", "offer": offer, "message": "Fare currency changed during revalidation."}
+        if scenario == "itinerary_change":
+            offer = dict(offer)
+            offer["itineraries"] = [dict(itinerary) for itinerary in offer["itineraries"]]
+            offer["itineraries"][0] = dict(offer["itineraries"][0])
+            offer["itineraries"][0]["segments"] = [dict(segment) for segment in offer["itineraries"][0]["segments"]]
+            offer["itineraries"][0]["segments"][0]["flightNumber"] = "OA999"
+            return {"status": "available", "offer": offer, "message": "Flight details changed during revalidation."}
+        if scenario == "price_decrease":
+            previous_total = dict(offer["pricing"]["total"])
+            offer = dict(offer)
+            offer["pricing"] = dict(offer["pricing"])
+            offer["pricing"]["total"] = {"amount": previous_total["amount"] - 2500, "currency": previous_total["currency"]}
+            return {"status": "price_changed", "offer": offer, "previousTotal": previous_total, "message": "Fare decreased during revalidation."}
         if scenario == "price_change":
             previous_total = dict(offer["pricing"]["total"])
             offer = dict(offer)

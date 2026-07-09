@@ -77,6 +77,7 @@ def test_resilient_states_cover_loading_empty_errors_conflicts_retries_and_succe
     search_states = {state["status"]: state for state in build_page_states("search")}
     booking_states = {state["status"]: state for state in build_page_states("booking_guest_details")}
     payment_states = {state["status"]: state for state in build_page_states("payment")}
+    review_states = {state["status"]: state for state in build_page_states("flight_booking_review")}
     admin_states = {state["status"]: state for state in build_page_states("admin_reservations")}
 
     assert {"loading", "empty", "validation_error", "error", "success", "retry"} <= set(search_states)
@@ -84,6 +85,10 @@ def test_resilient_states_cover_loading_empty_errors_conflicts_retries_and_succe
     assert [action["label"] for action in booking_states["conflict"]["actions"]] == ["Back to search", "Choose another room"]
     assert "not confirmed" in payment_states["payment_failure"]["message"]
     assert [action["label"] for action in payment_states["payment_failure"]["actions"]] == ["Retry payment", "Choose another room"]
+    assert {"unchanged_price", "price_increased", "price_decreased", "unavailable_offer", "retryable_failure", "revalidating", "currency_mismatch", "material_change"} <= set(review_states)
+    assert "blocked" in review_states["price_increased"]["message"]
+    assert [action["label"] for action in review_states["unavailable_offer"]["actions"]] == ["Choose another offer"]
+    assert [action["label"] for action in review_states["retryable_failure"]["actions"]] == ["Retry price check"]
     assert admin_states["empty"]["heading"] == "No admin reservations found"
     for state in [*search_states.values(), *booking_states.values(), *payment_states.values(), *admin_states.values()]:
         assert state["usesColorOnly"] is False
