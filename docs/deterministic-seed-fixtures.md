@@ -56,6 +56,31 @@ A single-night maintenance scenario also covers `2031-06-10` to `2031-06-11`.
 | Published/unpublished review moderation | `rev_bay_pub`, `rev_bay_unpub` | Public review queries should include published rows and exclude unpublished rows. |
 | Admin audit trail | `aud_seed_run`, `aud_hotel_closure`, `aud_room_type_closure`, `aud_refund` | Admin/back-office flows can verify deterministic audit records for seed, block, and refund actions. |
 
+## Automated booking test scenarios
+
+NIR-521 adds framework-neutral booking domain helpers and automated tests that use
+these fixtures without external services. The tests intentionally keep payment
+provider behavior mocked with `fixture_gateway` references and create temporary
+SQLite databases per case.
+
+- Utility coverage validates stay date parsing, total calculation, money payloads,
+  and occupancy/capacity decisions.
+- Availability integration coverage verifies overlapping reservations, hotel and
+  room blocks, back-to-back reservations, expired holds, and last-room inventory.
+- Reservation transaction coverage creates pending holds with `BEGIN IMMEDIATE`,
+  treats repeated reservation IDs as duplicate creation requests, and returns a
+  `409` conflict when the final room has already been held.
+- Payment lifecycle coverage records successful captures, voided failed payments,
+  payment amount mismatches, and duplicate webhook idempotency.
+- Cancellation coverage updates reservation state, refunds captured payments, and
+  releases room inventory.
+- Authorization and API contract coverage verifies shared success/error envelopes,
+  validation failures, conflicts, forbidden access, not-found responses, and
+  success payloads.
+- End-to-end coverage exercises guest search, room selection, guest details,
+  mocked payment, confirmation lookup, cross-user access denial, and eligible
+  cancellation.
+
 ## Availability query expectation
 
 A room is available when it is active, overlaps no hotel/room-type/room-level
