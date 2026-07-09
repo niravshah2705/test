@@ -16,7 +16,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Mapping
 
 from .flight_search import DEFAULT_NOW, _baggage_summary, _is_expired
-from .flights import DeterministicMockFlightProvider, FlightBookingService, FlightOffer, FlightProvider
+from .flights import DeterministicMockFlightProvider, FlightBookingService, FlightOffer, FlightProvider, FlightProviderTimeout, FlightProviderUnavailable, RevalidationResult
 from .profiles import ProfileRepository, ProfileValidationError
 from .public_api import ApiResponse, error_response, success_response
 
@@ -121,8 +121,28 @@ class BookingDraftRepository:
             "status": draft["status"],
             "createdAt": draft["created_at"],
             "expiresAt": draft["expires_at"],
+            "offerSnapshot": _parse_snapshot(draft["offer_snapshot"]),
             "passengerSnapshots": [_snapshot_payload(row) for row in passengers],
+            "revalidation": _parse_snapshot(draft["revalidation_snapshot"]) if "revalidation_snapshot" in draft.keys() else None,
+            "paymentAllowed": draft["status"] in {"price_validated", "price_change_accepted"},
         }
+
+    def update(self, draft_id: str, changes: Mapping[str, Any]) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = connection.execute("SELECT * FROM flight_booking_drafts WHERE id = ?", (draft_id,)).fetchone()
+            if current is None:
+                connection.rollback()
+                return None
+            status = changes.get("status", current["status"])
+            total = changes.get("total") or {"amountCents": current["total_cents"], "currency": current["currency"]}
+            revalidation = changes.get("revalidation")
+            connection.execute(
+                "UPDATE flight_booking_drafts SET status = ?, total_cents = ?, currency = ?, revalidation_snapshot = ? WHERE id = ?",
+                (status, int(total["amountCents"]), total["currency"], repr(revalidation) if revalidation is not None else current["revalidation_snapshot"], draft_id),
+            )
+            connection.commit()
+        return self.get(draft_id)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.database_path)
@@ -144,6 +164,15 @@ class InMemoryBookingDraftRepository:
     def get(self, draft_id: str) -> dict[str, Any] | None:
         draft = self.drafts.get(draft_id)
         return copy.deepcopy(draft) if draft else None
+
+    def update(self, draft_id: str, changes: Mapping[str, Any]) -> dict[str, Any] | None:
+        draft = self.drafts.get(draft_id)
+        if draft is None:
+            return None
+        updated = copy.deepcopy(draft)
+        updated.update(copy.deepcopy(dict(changes)))
+        self.drafts[draft_id] = updated
+        return copy.deepcopy(updated)
 
 
 def handle_offer_detail(
@@ -278,6 +307,8 @@ def create_booking_draft(
         "userId": user_id,
         "checkoutType": "authenticated" if user_id else "guest",
         "status": "draft",
+        "paymentAllowed": False,
+        "revalidation": None,
         "createdAt": _iso(now),
         "expiresAt": detail["expiresAt"],
         "contact": contact,
@@ -288,11 +319,154 @@ def create_booking_draft(
     return (repository or InMemoryBookingDraftRepository()).save(draft)
 
 
+def revalidate_booking_draft(
+    draft_id: str,
+    *,
+    repository: InMemoryBookingDraftRepository | BookingDraftRepository,
+    provider: FlightProvider | None = None,
+    scenario: str = "success",
+) -> dict[str, Any]:
+    """Re-check a booking draft offer and gate payment through explicit review states."""
+
+    draft = repository.get(draft_id)
+    if draft is None:
+        raise CheckoutValidationError({"draftId": ["Booking draft was not found."]})
+    existing = draft.get("revalidation") or {}
+    if existing.get("status") == "in_progress":
+        return booking_review_payload(draft)
+    if draft["status"] not in {"draft", "revalidating", "price_validated", "price_changed", "revalidation_failed"}:
+        raise CheckoutValidationError({"status": ["Booking draft cannot be revalidated from its current status."]})
+    if draft["status"] in {"price_validated", "price_changed"} and existing.get("scenario") == scenario:
+        return booking_review_payload(draft)
+
+    repository.update(draft_id, {"status": "revalidating", "revalidation": {"status": "in_progress", "scenario": scenario, "message": "Revalidation is already running."}})
+    try:
+        result = FlightBookingService(provider or DeterministicMockFlightProvider()).revalidateOffer(
+            draft["offerId"], passengers=tuple(draft.get("passengerSnapshots") or ()), scenario=scenario
+        )
+    except FlightProviderTimeout as exc:
+        updated = repository.update(draft_id, {"status": "revalidation_failed", "revalidation": _review_snapshot("retryable_failure", draft, None, str(exc), scenario)})
+        return booking_review_payload(updated or draft)
+    except FlightProviderUnavailable as exc:
+        updated = repository.update(draft_id, {"status": "revalidation_failed", "revalidation": _review_snapshot("retryable_failure", draft, None, str(exc), scenario)})
+        return booking_review_payload(updated or draft)
+
+    review_status = _classify_revalidation(draft, result)
+    new_total = result.offer.total.to_payload() if result.offer and review_status in {"unchanged", "price_increased", "price_decreased"} else draft["total"]
+    next_status = "price_validated" if review_status == "unchanged" else "price_changed" if review_status in {"price_increased", "price_decreased"} else "unavailable"
+    updated = repository.update(draft_id, {"status": next_status, "total": new_total if next_status == "price_validated" else draft["total"], "revalidation": _review_snapshot(review_status, draft, result, result.message, scenario)})
+    return booking_review_payload(updated or draft)
+
+
+def accept_revalidated_price(draft_id: str, *, repository: InMemoryBookingDraftRepository | BookingDraftRepository) -> dict[str, Any]:
+    draft = repository.get(draft_id)
+    if draft is None:
+        raise CheckoutValidationError({"draftId": ["Booking draft was not found."]})
+    revalidation = draft.get("revalidation") or {}
+    if draft["status"] != "price_changed" or revalidation.get("latestTotal") is None:
+        raise CheckoutValidationError({"revalidation": ["No changed price is waiting for acceptance."]})
+    updated = repository.update(draft_id, {"status": "price_change_accepted", "total": revalidation["latestTotal"], "revalidation": {**revalidation, "accepted": True}})
+    return booking_review_payload(updated or draft)
+
+
+def booking_review_payload(draft: dict[str, Any]) -> dict[str, Any]:
+    revalidation = draft.get("revalidation") or {"status": "not_started", "message": "Revalidate price before payment."}
+    payment_allowed = draft["status"] in {"price_validated", "price_change_accepted"}
+    actions = []
+    if revalidation.get("status") in {"price_increased", "price_decreased"} and not revalidation.get("accepted"):
+        actions.append({"label": "Accept new price", "action": "accept_price", "variant": "primary"})
+    if revalidation.get("status") in {"unavailable", "material_change", "currency_mismatch"}:
+        actions.append({"label": "Choose another offer", "href": "/search", "variant": "primary"})
+    if revalidation.get("status") in {"retryable_failure", "not_started"}:
+        actions.append({"label": "Retry price check", "action": "revalidate", "variant": "primary"})
+    return {"draftId": draft["id"], "status": draft["status"], "paymentAllowed": payment_allowed, "currentTotal": draft["total"], "revalidation": revalidation, "actions": actions}
+
+
+def handle_revalidate_booking_draft(draft_id: str, **kwargs: Any) -> ApiResponse:
+    try:
+        return success_response(revalidate_booking_draft(draft_id, **kwargs))
+    except CheckoutValidationError as exc:
+        return error_response(400, "validation_error", "Booking draft cannot be revalidated.", fields=exc.fields)
+
+
+def handle_accept_revalidated_price(draft_id: str, **kwargs: Any) -> ApiResponse:
+    try:
+        return success_response(accept_revalidated_price(draft_id, **kwargs))
+    except CheckoutValidationError as exc:
+        return error_response(400, "validation_error", "Changed price cannot be accepted.", fields=exc.fields)
+
+
+
 def handle_create_booking_draft(payload: Mapping[str, Any], **kwargs: Any) -> ApiResponse:
     try:
         return success_response(create_booking_draft(payload, **kwargs), status_code=201)
     except CheckoutValidationError as exc:
         return error_response(400, "validation_error", "Checkout fields failed validation.", fields=exc.fields)
+
+
+def _classify_revalidation(draft: dict[str, Any], result: RevalidationResult) -> str:
+    if result.status == "unavailable" or result.offer is None:
+        return "unavailable"
+    latest = result.offer.to_payload()
+    snapshot = draft["offerSnapshot"]
+    if latest["total"]["currency"] != draft["total"]["currency"]:
+        return "currency_mismatch"
+    if _material_flight_signature(latest) != _material_flight_signature(snapshot):
+        return "material_change"
+    latest_amount = latest["total"]["amountCents"]
+    current_amount = draft["total"]["amountCents"]
+    if latest_amount > current_amount:
+        return "price_increased"
+    if latest_amount < current_amount:
+        return "price_decreased"
+    return "unchanged"
+
+
+def _review_snapshot(status: str, draft: dict[str, Any], result: RevalidationResult | None, message: str | None, scenario: str) -> dict[str, Any]:
+    latest_total = result.offer.total.to_payload() if result and result.offer else None
+    return {
+        "status": status,
+        "scenario": scenario,
+        "message": message or _review_message(status),
+        "previousTotal": draft["total"],
+        "latestTotal": latest_total,
+        "priceDeltaCents": (latest_total["amountCents"] - draft["total"]["amountCents"]) if latest_total and latest_total["currency"] == draft["total"]["currency"] else None,
+        "paymentBlocked": status != "unchanged",
+        "accepted": False,
+    }
+
+
+def _review_message(status: str) -> str:
+    return {
+        "unchanged": "Price rechecked successfully. You can continue to payment.",
+        "price_increased": "The fare increased. Payment is blocked until you accept the new price.",
+        "price_decreased": "The fare decreased. Accept the new price before payment.",
+        "unavailable": "This offer is no longer available. Choose another offer.",
+        "material_change": "Flight details changed materially. Choose another offer.",
+        "currency_mismatch": "Currency changed unexpectedly. Choose another offer.",
+        "retryable_failure": "Price could not be rechecked. Retry before payment.",
+    }.get(status, "Revalidation status changed.")
+
+
+def _material_flight_signature(payload: dict[str, Any]) -> tuple[tuple[Any, ...], ...]:
+    itineraries = payload.get("itineraries") or []
+    return tuple(
+        tuple((segment.get("marketingCarrier"), segment.get("operatingCarrier"), segment.get("flightNumber"), segment.get("origin"), segment.get("destination"), segment.get("departsAt"), segment.get("arrivesAt")) for segment in itinerary.get("segments", []))
+        for itinerary in itineraries
+    )
+
+
+def _parse_snapshot(raw: Any) -> Any:
+    if raw in (None, "None"):
+        return None
+    if isinstance(raw, str):
+        try:
+            import ast
+            return ast.literal_eval(raw)
+        except Exception:
+            return None
+    return raw
+
 
 
 def _validate_contact(raw: Mapping[str, Any], errors: dict[str, list[str]]) -> dict[str, str]:
@@ -503,13 +677,18 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             contact_phone TEXT NOT NULL,
             total_cents INTEGER NOT NULL,
             currency TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('draft', 'submitted', 'expired')),
+            status TEXT NOT NULL CHECK (status IN ('draft', 'submitted', 'expired', 'revalidating', 'price_validated', 'price_changed', 'price_change_accepted', 'unavailable', 'revalidation_failed')),
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
-            offer_snapshot TEXT NOT NULL
+            offer_snapshot TEXT NOT NULL,
+            revalidation_snapshot TEXT
         )
         """
     )
+    try:
+        connection.execute("ALTER TABLE flight_booking_drafts ADD COLUMN revalidation_snapshot TEXT")
+    except sqlite3.OperationalError:
+        pass
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS flight_booking_passenger_snapshots (
@@ -537,4 +716,5 @@ def _snapshot_payload(row: sqlite3.Row) -> dict[str, Any]:
         "dateOfBirth": row["date_of_birth"],
         "passengerType": row["passenger_type"],
         "gender": row["gender"],
+        "document": _parse_snapshot(row["document_snapshot"]),
     }
