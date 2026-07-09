@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import date
 from math import ceil
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 
 MAX_PAGE_SIZE = 50
 DEFAULT_PAGE = 1
@@ -87,6 +87,7 @@ def search_hotels(database_path: str, query: dict[str, str]) -> ApiResponse:
     destination = validation["destination"]
     check_in = validation["check_in"]
     check_out = validation["check_out"]
+    has_dates = check_in is not None and check_out is not None
     guests = validation["adults"] + validation["children"]
     page = validation["page"]
     page_size = validation["page_size"]
@@ -118,10 +119,14 @@ def search_hotels(database_path: str, query: dict[str, str]) -> ApiResponse:
                     "starRating": hotel["star_rating"],
                     "description": hotel["description"],
                     "images": _hotel_images(connection, hotel["id"]),
+                    "primaryImage": _primary_hotel_image(connection, hotel["id"]),
                     "amenities": _amenities(connection, hotel["id"]),
                     "reviewSummary": _review_summary(connection, hotel["id"]),
                     "price": minimum_price,
+                    "startingPrice": minimum_price,
                     "availableRoomTypes": len(room_types),
+                    "availabilityStatus": "available" if has_dates else "dates_required",
+                    "canBook": has_dates,
                 }
             )
 
@@ -138,13 +143,73 @@ def search_hotels(database_path: str, query: dict[str, str]) -> ApiResponse:
         },
         "query": {
             "destination": destination,
-            "checkIn": check_in,
-            "checkOut": check_out,
+            "checkIn": check_in or "",
+            "checkOut": check_out or "",
             "adults": validation["adults"],
             "children": validation["children"],
         },
+        "pageLinks": _pagination_links(
+            "/api/search/hotels",
+            {
+                "destination": destination,
+                "checkIn": check_in or "",
+                "checkOut": check_out or "",
+                "adults": str(validation["adults"]),
+                "children": str(validation["children"]),
+                "pageSize": str(page_size),
+            },
+            page=page,
+            total_pages=ceil(total / page_size) if total else 0,
+        ),
     }
     return success_response(data, meta=meta)
+
+
+def render_search_page_model(database_path: str, query_string: str = "") -> dict[str, Any]:
+    """Build a framework-neutral hotel search page view model.
+
+    The model contains form values, field-level errors, loading/empty state flags,
+    result-card data, and pagination links that preserve the selected filters.
+    """
+
+    response = handle_get(database_path, "/api/search/hotels", query_string)
+    parsed_query = {key: values[-1] for key, values in parse_qs(query_string, keep_blank_values=True).items()}
+    default_values = {
+        "destination": (parsed_query.get("destination") or "").strip(),
+        "checkIn": (parsed_query.get("checkIn") or "").strip(),
+        "checkOut": (parsed_query.get("checkOut") or "").strip(),
+        "adults": parsed_query.get("adults") or "1",
+        "children": parsed_query.get("children") or "0",
+    }
+
+    if not response.body["success"]:
+        return {
+            "form": {"values": default_values, "errors": response.body["error"].get("fields", {})},
+            "results": [],
+            "state": {"loading": False, "empty": False},
+            "pagination": {"page": 1, "pageSize": DEFAULT_PAGE_SIZE, "total": 0, "totalPages": 0},
+            "pageLinks": {},
+        }
+
+    meta = response.body["meta"]
+    query = meta["query"]
+    cards = [_search_result_card(result) for result in response.body["data"]]
+    return {
+        "form": {
+            "values": {
+                "destination": query["destination"],
+                "checkIn": query["checkIn"],
+                "checkOut": query["checkOut"],
+                "adults": str(query["adults"]),
+                "children": str(query["children"]),
+            },
+            "errors": {},
+        },
+        "results": cards,
+        "state": {"loading": False, "empty": len(cards) == 0},
+        "pagination": meta["pagination"],
+        "pageLinks": meta["pageLinks"],
+    }
 
 
 def get_hotel_detail(database_path: str, slug: str) -> ApiResponse:
@@ -240,8 +305,16 @@ def _validate_stay_and_occupancy(query: dict[str, str], *, require_destination: 
 
     check_in_raw = (query.get("checkIn") or "").strip()
     check_out_raw = (query.get("checkOut") or "").strip()
-    check_in = _parse_date(check_in_raw, "checkIn", errors)
-    check_out = _parse_date(check_out_raw, "checkOut", errors)
+    require_dates = not require_destination
+    has_partial_dates = bool(check_in_raw) != bool(check_out_raw)
+    if has_partial_dates:
+        if not check_in_raw:
+            errors["checkIn"] = ["Date is required when checkOut is supplied."]
+        if not check_out_raw:
+            errors["checkOut"] = ["Date is required when checkIn is supplied."]
+
+    check_in = _parse_date(check_in_raw, "checkIn", errors, required=require_dates)
+    check_out = _parse_date(check_out_raw, "checkOut", errors, required=require_dates)
     if check_in and check_out and check_out <= check_in:
         errors.setdefault("checkOut", []).append("Must be after checkIn.")
 
@@ -257,16 +330,17 @@ def _validate_stay_and_occupancy(query: dict[str, str], *, require_destination: 
     return {
         "errors": errors,
         "destination": destination,
-        "check_in": check_in_raw,
-        "check_out": check_out_raw,
+        "check_in": check_in_raw if check_in is not None else None,
+        "check_out": check_out_raw if check_out is not None else None,
         "adults": adults if adults is not None else 1,
         "children": children if children is not None else 0,
     }
 
 
-def _parse_date(value: str, field: str, errors: dict[str, list[str]]) -> date | None:
+def _parse_date(value: str, field: str, errors: dict[str, list[str]], *, required: bool) -> date | None:
     if not value:
-        errors[field] = ["Date is required in YYYY-MM-DD format."]
+        if required:
+            errors[field] = ["Date is required in YYYY-MM-DD format."]
         return None
     try:
         return date.fromisoformat(value)
@@ -295,6 +369,40 @@ def _validation_error(fields: dict[str, list[str]]) -> ApiResponse:
     return error_response(400, "validation_error", "Request parameters failed validation.", fields=fields)
 
 
+def _pagination_links(
+    path: str,
+    query: dict[str, str],
+    *,
+    page: int,
+    total_pages: int,
+) -> dict[str, str | None]:
+    def link(target_page: int) -> str:
+        return f"{path}?{urlencode({**query, 'page': str(target_page)})}"
+
+    if total_pages == 0:
+        return {"self": link(page), "next": None, "previous": None}
+    return {
+        "self": link(page),
+        "next": link(page + 1) if page < total_pages else None,
+        "previous": link(page - 1) if page > 1 else None,
+    }
+
+
+def _search_result_card(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "title": result["name"],
+        "location": f"{result['city']}, {result['country']}",
+        "primaryImage": result["primaryImage"],
+        "rating": result["reviewSummary"]["averageRating"],
+        "description": result["description"],
+        "amenities": result["amenities"],
+        "startingPrice": result["startingPrice"],
+        "availabilityStatus": result["availabilityStatus"],
+        "canBook": result["canBook"],
+        "hotelSlug": result["slug"],
+    }
+
+
 def _not_found() -> ApiResponse:
     return error_response(404, "not_found", "Hotel not found.")
 
@@ -317,6 +425,11 @@ def _hotel_images(connection: sqlite3.Connection, hotel_id: str) -> list[dict[st
         (hotel_id,),
     ).fetchall()
     return [{"url": row["url"], "altText": row["alt_text"]} for row in rows]
+
+
+def _primary_hotel_image(connection: sqlite3.Connection, hotel_id: str) -> dict[str, Any] | None:
+    images = _hotel_images(connection, hotel_id)
+    return images[0] if images else None
 
 
 def _room_images(connection: sqlite3.Connection, room_type_id: str) -> list[dict[str, Any]]:

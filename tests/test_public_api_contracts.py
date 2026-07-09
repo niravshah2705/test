@@ -1,7 +1,7 @@
 import sqlite3
 
 from hbw_seed import reset_and_seed
-from hbw_seed.public_api import MAX_PAGE_SIZE, handle_get
+from hbw_seed.public_api import MAX_PAGE_SIZE, handle_get, render_search_page_model
 
 SEARCH_QUERY = "destination=San%20Francisco&checkIn=2031-06-10&checkOut=2031-06-12&adults=2&children=0&page=1&pageSize=10"
 
@@ -57,6 +57,11 @@ def test_get_search_hotels_success_response_shape_and_public_fields(tmp_path):
             "adults": 2,
             "children": 0,
         },
+        "pageLinks": {
+            "self": "/api/search/hotels?destination=San+Francisco&checkIn=2031-06-10&checkOut=2031-06-12&adults=2&children=0&pageSize=10&page=1",
+            "next": None,
+            "previous": None,
+        },
     }
     assert response.body["data"] == [
         {
@@ -72,10 +77,17 @@ def test_get_search_hotels_success_response_shape_and_public_fields(tmp_path):
                     "altText": "Mission Garden Inn courtyard",
                 }
             ],
+            "primaryImage": {
+                "url": "https://fixtures.example.test/hotels/mission-garden-inn/courtyard.jpg",
+                "altText": "Mission Garden Inn courtyard",
+            },
             "amenities": [{"name": "Breakfast"}, {"name": "Parking"}, {"name": "Wi-Fi"}],
             "reviewSummary": {"count": 1, "averageRating": 4.0},
             "price": {"amountCents": 26000, "currency": "USD", "unit": "night"},
+            "startingPrice": {"amountCents": 26000, "currency": "USD", "unit": "night"},
             "availableRoomTypes": 1,
+            "availabilityStatus": "available",
+            "canBook": True,
         }
     ]
     assert_no_sensitive_keys(response.body)
@@ -93,6 +105,86 @@ def test_get_search_hotels_empty_search_response_shape(tmp_path):
     assert_enveloped_success(response)
     assert response.body["data"] == []
     assert response.body["meta"]["pagination"] == {"page": 1, "pageSize": 20, "total": 0, "totalPages": 0}
+
+
+def test_get_search_hotels_without_dates_returns_non_bookable_active_hotels(tmp_path):
+    database = seeded_database(tmp_path)
+
+    response = handle_get(
+        str(database),
+        "/api/search/hotels",
+        "destination=San%20Francisco&adults=2&children=0&page=1&pageSize=1",
+    )
+
+    assert_enveloped_success(response)
+    assert response.body["meta"]["pagination"] == {"page": 1, "pageSize": 1, "total": 2, "totalPages": 2}
+    assert response.body["meta"]["query"] == {
+        "destination": "San Francisco",
+        "checkIn": "",
+        "checkOut": "",
+        "adults": 2,
+        "children": 0,
+    }
+    assert response.body["meta"]["pageLinks"] == {
+        "self": "/api/search/hotels?destination=San+Francisco&checkIn=&checkOut=&adults=2&children=0&pageSize=1&page=1",
+        "next": "/api/search/hotels?destination=San+Francisco&checkIn=&checkOut=&adults=2&children=0&pageSize=1&page=2",
+        "previous": None,
+    }
+    assert [hotel["slug"] for hotel in response.body["data"]] == ["bay-view-grand"]
+    assert response.body["data"][0]["availabilityStatus"] == "dates_required"
+    assert response.body["data"][0]["canBook"] is False
+
+
+def test_get_search_hotels_partial_dates_return_field_errors(tmp_path):
+    database = seeded_database(tmp_path)
+
+    response = handle_get(
+        str(database),
+        "/api/search/hotels",
+        "destination=San%20Francisco&checkIn=2031-06-10&adults=2&children=0",
+    )
+
+    assert response.status_code == 400
+    assert response.body["error"]["fields"] == {"checkOut": ["Date is required when checkIn is supplied."]}
+
+
+def test_render_search_page_model_exposes_result_cards_and_empty_state(tmp_path):
+    database = seeded_database(tmp_path)
+
+    results = render_search_page_model(
+        str(database),
+        "destination=San%20Francisco&checkIn=2031-06-10&checkOut=2031-06-12&adults=2&children=1&page=1&pageSize=10",
+    )
+    empty = render_search_page_model(
+        str(database),
+        "destination=New%20York&checkIn=2031-06-10&checkOut=2031-06-12&adults=2&children=0",
+    )
+    invalid = render_search_page_model(
+        str(database),
+        "destination=San%20Francisco&checkIn=2031-06-12&checkOut=2031-06-10&adults=2&children=0",
+    )
+
+    assert results["state"] == {"loading": False, "empty": False}
+    assert results["results"] == [
+        {
+            "title": "Mission Garden Inn",
+            "location": "San Francisco, US",
+            "primaryImage": {
+                "url": "https://fixtures.example.test/hotels/mission-garden-inn/courtyard.jpg",
+                "altText": "Mission Garden Inn courtyard",
+            },
+            "rating": 4.0,
+            "description": "Boutique hotel used for room-type closure and guest checkout fixtures.",
+            "amenities": [{"name": "Breakfast"}, {"name": "Parking"}, {"name": "Wi-Fi"}],
+            "startingPrice": {"amountCents": 26000, "currency": "USD", "unit": "night"},
+            "availabilityStatus": "available",
+            "canBook": True,
+            "hotelSlug": "mission-garden-inn",
+        }
+    ]
+    assert empty["state"] == {"loading": False, "empty": True}
+    assert empty["results"] == []
+    assert invalid["form"]["errors"] == {"checkOut": ["Must be after checkIn."]}
 
 
 def test_get_search_hotels_invalid_inputs_return_structured_errors(tmp_path):
