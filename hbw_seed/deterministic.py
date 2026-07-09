@@ -36,7 +36,9 @@ SCHEMA_STATEMENTS = [
     "DROP TABLE IF EXISTS reviews",
     "DROP TABLE IF EXISTS room_images",
     "DROP TABLE IF EXISTS hotel_images",
+    "DROP TABLE IF EXISTS images",
     "DROP TABLE IF EXISTS rooms",
+    "DROP TABLE IF EXISTS room_type_amenities",
     "DROP TABLE IF EXISTS room_types",
     "DROP TABLE IF EXISTS hotel_policies",
     "DROP TABLE IF EXISTS hotel_amenities",
@@ -120,17 +122,24 @@ SCHEMA_STATEMENTS = [
         slug TEXT NOT NULL UNIQUE,
         name TEXT NOT NULL,
         city TEXT NOT NULL,
-        country TEXT NOT NULL,
+        country TEXT NOT NULL CHECK (length(country) = 2 AND country = upper(country)),
         address TEXT NOT NULL,
-        star_rating INTEGER NOT NULL,
+        latitude REAL,
+        longitude REAL,
+        star_rating INTEGER CHECK (star_rating IS NULL OR star_rating BETWEEN 1 AND 5),
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
         is_searchable INTEGER NOT NULL DEFAULT 1,
-        description TEXT NOT NULL
+        description TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        CHECK ((latitude IS NULL AND longitude IS NULL) OR (latitude BETWEEN -90 AND 90 AND longitude BETWEEN -180 AND 180))
     )
     """,
     """
     CREATE TABLE amenities (
         id TEXT PRIMARY KEY,
-        name TEXT NOT NULL UNIQUE
+        name TEXT NOT NULL UNIQUE,
+        category TEXT NOT NULL DEFAULT 'general'
     )
     """,
     """
@@ -153,40 +162,65 @@ SCHEMA_STATEMENTS = [
         id TEXT PRIMARY KEY,
         hotel_id TEXT NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
         name TEXT NOT NULL,
-        capacity INTEGER NOT NULL,
-        nightly_rate_cents INTEGER NOT NULL,
-        currency TEXT NOT NULL DEFAULT 'USD',
-        description TEXT NOT NULL
+        capacity INTEGER NOT NULL CHECK (capacity > 0),
+        bed_description TEXT NOT NULL,
+        nightly_rate_cents INTEGER NOT NULL CHECK (nightly_rate_cents >= 0),
+        currency TEXT NOT NULL DEFAULT 'USD' CHECK (currency IN ('USD', 'EUR', 'GBP', 'CAD')),
+        status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'inactive')),
+        description TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE room_type_amenities (
+        room_type_id TEXT NOT NULL REFERENCES room_types(id) ON DELETE CASCADE,
+        amenity_id TEXT NOT NULL REFERENCES amenities(id) ON DELETE CASCADE,
+        PRIMARY KEY (room_type_id, amenity_id)
     )
     """,
     """
     CREATE TABLE rooms (
         id TEXT PRIMARY KEY,
-        room_type_id TEXT NOT NULL REFERENCES room_types(id) ON DELETE CASCADE,
+        room_type_id TEXT NOT NULL REFERENCES room_types(id) ON DELETE RESTRICT,
         room_number TEXT NOT NULL,
         floor INTEGER NOT NULL,
-        status TEXT NOT NULL CHECK (status IN ('active', 'maintenance')),
+        status TEXT NOT NULL CHECK (status IN ('active', 'out_of_service', 'maintenance')),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
         UNIQUE (room_type_id, room_number)
     )
     """,
     """
-    CREATE TABLE hotel_images (
+    CREATE TABLE images (
         id TEXT PRIMARY KEY,
-        hotel_id TEXT NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
         url TEXT NOT NULL,
         alt_text TEXT NOT NULL,
-        sort_order INTEGER NOT NULL
+        sort_order INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    )
+    """,
+    """
+    CREATE TABLE hotel_images (
+        hotel_id TEXT NOT NULL REFERENCES hotels(id) ON DELETE CASCADE,
+        image_id TEXT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+        PRIMARY KEY (hotel_id, image_id)
     )
     """,
     """
     CREATE TABLE room_images (
-        id TEXT PRIMARY KEY,
         room_type_id TEXT NOT NULL REFERENCES room_types(id) ON DELETE CASCADE,
-        url TEXT NOT NULL,
-        alt_text TEXT NOT NULL,
-        sort_order INTEGER NOT NULL
+        image_id TEXT NOT NULL REFERENCES images(id) ON DELETE CASCADE,
+        PRIMARY KEY (room_type_id, image_id)
     )
     """,
+
+    "CREATE INDEX idx_hotels_city ON hotels(city)",
+    "CREATE INDEX idx_hotels_country ON hotels(country)",
+    "CREATE INDEX idx_hotels_status ON hotels(status)",
+    "CREATE INDEX idx_room_types_hotel_id ON room_types(hotel_id)",
+    "CREATE INDEX idx_rooms_room_type_id ON rooms(room_type_id)",
+    "CREATE INDEX idx_images_sort_order ON images(sort_order)",
     """
     CREATE TABLE reviews (
         id TEXT PRIMARY KEY,
@@ -307,9 +341,14 @@ HOTELS = [
         "San Francisco",
         "US",
         "100 Market Street, San Francisco, CA",
+        37.7936,
+        -122.3958,
         5,
+        "active",
         1,
         "Waterfront business hotel used for partial availability and sold-out fixtures.",
+        "2031-01-01T00:00:00Z",
+        "2031-01-01T00:00:00Z",
     ),
     (
         "htl_sfo_garden",
@@ -318,9 +357,14 @@ HOTELS = [
         "San Francisco",
         "US",
         "45 Valencia Street, San Francisco, CA",
+        37.7700,
+        -122.4221,
         4,
+        "active",
         1,
         "Boutique hotel used for room-type closure and guest checkout fixtures.",
+        "2031-01-01T00:00:00Z",
+        "2031-01-01T00:00:00Z",
     ),
     (
         "htl_nyc_loft",
@@ -329,19 +373,24 @@ HOTELS = [
         "New York",
         "US",
         "12 West 31st Street, New York, NY",
+        40.7477,
+        -73.9867,
         4,
+        "active",
         1,
         "City hotel used for hotel-level closure fixtures.",
+        "2031-01-01T00:00:00Z",
+        "2031-01-01T00:00:00Z",
     ),
 ]
 
 AMENITIES = [
-    ("amn_wifi", "Wi-Fi"),
-    ("amn_breakfast", "Breakfast"),
-    ("amn_pool", "Pool"),
-    ("amn_parking", "Parking"),
-    ("amn_spa", "Spa"),
-    ("amn_gym", "Fitness Center"),
+    ("amn_wifi", "Wi-Fi", "connectivity"),
+    ("amn_breakfast", "Breakfast", "dining"),
+    ("amn_pool", "Pool", "recreation"),
+    ("amn_parking", "Parking", "property"),
+    ("amn_spa", "Spa", "wellness"),
+    ("amn_gym", "Fitness Center", "wellness"),
 ]
 
 HOTEL_AMENITIES = [
@@ -367,44 +416,69 @@ POLICIES = [
 ]
 
 ROOM_TYPES = [
-    ("rt_bay_king", "htl_sfo_bay", "Deluxe King", 2, 24000, "USD", "King room with bay views."),
-    ("rt_bay_suite", "htl_sfo_bay", "Executive Suite", 4, 42000, "USD", "Suite with separate living area."),
-    ("rt_garden_queen", "htl_sfo_garden", "Garden Queen", 2, 18000, "USD", "Quiet queen room facing the courtyard."),
-    ("rt_garden_family", "htl_sfo_garden", "Family Studio", 4, 26000, "USD", "Studio with sofa bed and kitchenette."),
-    ("rt_loft_queen", "htl_nyc_loft", "Loft Queen", 2, 21000, "USD", "High-ceiling queen room."),
-    ("rt_loft_double", "htl_nyc_loft", "Double Double", 4, 30000, "USD", "Two double beds for groups."),
+    ("rt_bay_king", "htl_sfo_bay", "Deluxe King", 2, "1 king bed", 24000, "USD", "active", "King room with bay views.", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("rt_bay_suite", "htl_sfo_bay", "Executive Suite", 4, "1 king bed and 1 sofa bed", 42000, "USD", "active", "Suite with separate living area.", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("rt_garden_queen", "htl_sfo_garden", "Garden Queen", 2, "1 queen bed", 18000, "USD", "active", "Quiet queen room facing the courtyard.", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("rt_garden_family", "htl_sfo_garden", "Family Studio", 4, "1 queen bed and 1 sofa bed", 26000, "USD", "active", "Studio with sofa bed and kitchenette.", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("rt_loft_queen", "htl_nyc_loft", "Loft Queen", 2, "1 queen bed", 21000, "USD", "active", "High-ceiling queen room.", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("rt_loft_double", "htl_nyc_loft", "Double Double", 4, "2 double beds", 30000, "USD", "active", "Two double beds for groups.", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
 ]
 
 ROOMS = [
-    ("room_bay_king_501", "rt_bay_king", "501", 5, "active"),
-    ("room_bay_king_502", "rt_bay_king", "502", 5, "active"),
-    ("room_bay_suite_601", "rt_bay_suite", "601", 6, "active"),
-    ("room_bay_suite_602", "rt_bay_suite", "602", 6, "active"),
-    ("room_garden_queen_201", "rt_garden_queen", "201", 2, "active"),
-    ("room_garden_queen_202", "rt_garden_queen", "202", 2, "active"),
-    ("room_garden_family_301", "rt_garden_family", "301", 3, "active"),
-    ("room_garden_family_302", "rt_garden_family", "302", 3, "active"),
-    ("room_loft_queen_801", "rt_loft_queen", "801", 8, "active"),
-    ("room_loft_queen_802", "rt_loft_queen", "802", 8, "active"),
-    ("room_loft_double_901", "rt_loft_double", "901", 9, "active"),
-    ("room_loft_double_902", "rt_loft_double", "902", 9, "active"),
+    ("room_bay_king_501", "rt_bay_king", "501", 5, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_bay_king_502", "rt_bay_king", "502", 5, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_bay_suite_601", "rt_bay_suite", "601", 6, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_bay_suite_602", "rt_bay_suite", "602", 6, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_garden_queen_201", "rt_garden_queen", "201", 2, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_garden_queen_202", "rt_garden_queen", "202", 2, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_garden_family_301", "rt_garden_family", "301", 3, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_garden_family_302", "rt_garden_family", "302", 3, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_loft_queen_801", "rt_loft_queen", "801", 8, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_loft_queen_802", "rt_loft_queen", "802", 8, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_loft_double_901", "rt_loft_double", "901", 9, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+    ("room_loft_double_902", "rt_loft_double", "902", 9, "active", "2031-01-01T00:00:00Z", "2031-01-01T00:00:00Z"),
+]
+
+IMAGES = [
+    ("img_bay_1", "https://fixtures.example.test/hotels/bay-view-grand/exterior.jpg", "Bay View Grand exterior", 1, "2031-01-01T00:00:00Z"),
+    ("img_bay_2", "https://fixtures.example.test/hotels/bay-view-grand/lobby.jpg", "Bay View Grand lobby", 2, "2031-01-01T00:00:00Z"),
+    ("img_garden_1", "https://fixtures.example.test/hotels/mission-garden-inn/courtyard.jpg", "Mission Garden Inn courtyard", 1, "2031-01-01T00:00:00Z"),
+    ("img_loft_1", "https://fixtures.example.test/hotels/central-loft-hotel/roof.jpg", "Central Loft Hotel roof deck", 1, "2031-01-01T00:00:00Z"),
+    ("img_rt_bay_king", "https://fixtures.example.test/rooms/deluxe-king.jpg", "Deluxe King bed", 1, "2031-01-01T00:00:00Z"),
+    ("img_rt_bay_suite", "https://fixtures.example.test/rooms/executive-suite.jpg", "Executive Suite living room", 1, "2031-01-01T00:00:00Z"),
+    ("img_rt_garden_queen", "https://fixtures.example.test/rooms/garden-queen.jpg", "Garden Queen room", 1, "2031-01-01T00:00:00Z"),
+    ("img_rt_garden_family", "https://fixtures.example.test/rooms/family-studio.jpg", "Family Studio room", 1, "2031-01-01T00:00:00Z"),
+    ("img_rt_loft_queen", "https://fixtures.example.test/rooms/loft-queen.jpg", "Loft Queen room", 1, "2031-01-01T00:00:00Z"),
+    ("img_rt_loft_double", "https://fixtures.example.test/rooms/double-double.jpg", "Double Double room", 1, "2031-01-01T00:00:00Z"),
 ]
 
 HOTEL_IMAGES = [
-    ("img_bay_1", "htl_sfo_bay", "https://fixtures.example.test/hotels/bay-view-grand/exterior.jpg", "Bay View Grand exterior", 1),
-    ("img_bay_2", "htl_sfo_bay", "https://fixtures.example.test/hotels/bay-view-grand/lobby.jpg", "Bay View Grand lobby", 2),
-    ("img_garden_1", "htl_sfo_garden", "https://fixtures.example.test/hotels/mission-garden-inn/courtyard.jpg", "Mission Garden Inn courtyard", 1),
-    ("img_loft_1", "htl_nyc_loft", "https://fixtures.example.test/hotels/central-loft-hotel/roof.jpg", "Central Loft Hotel roof deck", 1),
+    ("htl_sfo_bay", "img_bay_1"),
+    ("htl_sfo_bay", "img_bay_2"),
+    ("htl_sfo_garden", "img_garden_1"),
+    ("htl_nyc_loft", "img_loft_1"),
 ]
 
 ROOM_IMAGES = [
-    ("img_rt_bay_king", "rt_bay_king", "https://fixtures.example.test/rooms/deluxe-king.jpg", "Deluxe King bed", 1),
-    ("img_rt_bay_suite", "rt_bay_suite", "https://fixtures.example.test/rooms/executive-suite.jpg", "Executive Suite living room", 1),
-    ("img_rt_garden_queen", "rt_garden_queen", "https://fixtures.example.test/rooms/garden-queen.jpg", "Garden Queen room", 1),
-    ("img_rt_garden_family", "rt_garden_family", "https://fixtures.example.test/rooms/family-studio.jpg", "Family Studio room", 1),
-    ("img_rt_loft_queen", "rt_loft_queen", "https://fixtures.example.test/rooms/loft-queen.jpg", "Loft Queen room", 1),
-    ("img_rt_loft_double", "rt_loft_double", "https://fixtures.example.test/rooms/double-double.jpg", "Double Double room", 1),
+    ("rt_bay_king", "img_rt_bay_king"),
+    ("rt_bay_suite", "img_rt_bay_suite"),
+    ("rt_garden_queen", "img_rt_garden_queen"),
+    ("rt_garden_family", "img_rt_garden_family"),
+    ("rt_loft_queen", "img_rt_loft_queen"),
+    ("rt_loft_double", "img_rt_loft_double"),
 ]
+
+ROOM_TYPE_AMENITIES = [
+    ("rt_bay_king", "amn_wifi"),
+    ("rt_bay_suite", "amn_wifi"),
+    ("rt_bay_suite", "amn_spa"),
+    ("rt_garden_queen", "amn_wifi"),
+    ("rt_garden_family", "amn_wifi"),
+    ("rt_garden_family", "amn_breakfast"),
+    ("rt_loft_queen", "amn_wifi"),
+    ("rt_loft_double", "amn_wifi"),
+]
+
 
 REVIEWS = [
     ("rev_bay_pub", "htl_sfo_bay", "usr_guest", "Gale Guest", 5, "Reliable stay", "Great bay views and fast check-in.", "published", "2031-02-01T12:00:00Z"),
@@ -487,7 +561,9 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
         _insert_many(connection, "hotel_amenities", HOTEL_AMENITIES)
         _insert_many(connection, "hotel_policies", POLICIES)
         _insert_many(connection, "room_types", ROOM_TYPES)
+        _insert_many(connection, "room_type_amenities", ROOM_TYPE_AMENITIES)
         _insert_many(connection, "rooms", ROOMS)
+        _insert_many(connection, "images", IMAGES)
         _insert_many(connection, "hotel_images", HOTEL_IMAGES)
         _insert_many(connection, "room_images", ROOM_IMAGES)
         _insert_many(connection, "reviews", REVIEWS)
@@ -506,8 +582,13 @@ def reset_and_seed(database_path: str | Path) -> dict[str, int]:
             "passenger_documents",
             "hotels",
             "amenities",
+            "hotel_amenities",
             "room_types",
+            "room_type_amenities",
             "rooms",
+            "images",
+            "hotel_images",
+            "room_images",
             "reviews",
             "reservations",
             "availability_blocks",

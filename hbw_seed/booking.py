@@ -669,7 +669,7 @@ def admin_update_hotel(
 ) -> dict[str, Any]:
     """Update safe hotel admin fields and record a blocking audit event."""
 
-    allowed = {"name", "city", "country", "address", "star_rating", "is_searchable", "description"}
+    allowed = {"name", "city", "country", "address", "latitude", "longitude", "star_rating", "status", "is_searchable", "description", "updated_at"}
     return _admin_update_entity(
         database_path,
         table="hotels",
@@ -693,7 +693,7 @@ def admin_update_room_type(
 ) -> dict[str, Any]:
     """Update safe room-type admin fields and record a blocking audit event."""
 
-    allowed = {"name", "capacity", "nightly_rate_cents", "currency", "description"}
+    allowed = {"name", "capacity", "bed_description", "nightly_rate_cents", "currency", "status", "description", "updated_at"}
     with _connect(database_path) as connection:
         row = connection.execute("SELECT * FROM room_types WHERE id = ?", (room_type_id,)).fetchone()
         if row is None:

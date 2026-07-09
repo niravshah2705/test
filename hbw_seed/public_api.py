@@ -100,7 +100,8 @@ def search_hotels(database_path: str, query: dict[str, str]) -> ApiResponse:
             """
             SELECT hotel.*
             FROM hotels AS hotel
-            WHERE hotel.is_searchable = 1
+            WHERE hotel.status = 'active'
+              AND hotel.is_searchable = 1
               AND (LOWER(hotel.city) LIKE ? OR LOWER(hotel.country) LIKE ? OR LOWER(hotel.name) LIKE ?)
             ORDER BY hotel.name
             """,
@@ -314,7 +315,7 @@ def _not_found() -> ApiResponse:
 
 def _active_hotel_by_slug(connection: sqlite3.Connection, slug: str) -> sqlite3.Row | None:
     return connection.execute(
-        "SELECT * FROM hotels WHERE slug = ? AND is_searchable = 1",
+        "SELECT * FROM hotels WHERE slug = ? AND status = 'active' AND is_searchable = 1",
         (slug,),
     ).fetchone()
 
@@ -322,10 +323,11 @@ def _active_hotel_by_slug(connection: sqlite3.Connection, slug: str) -> sqlite3.
 def _hotel_images(connection: sqlite3.Connection, hotel_id: str) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
-        SELECT url, alt_text
-        FROM hotel_images
-        WHERE hotel_id = ?
-        ORDER BY sort_order, id
+        SELECT image.url, image.alt_text
+        FROM images AS image
+        JOIN hotel_images AS hotel_image ON hotel_image.image_id = image.id
+        WHERE hotel_image.hotel_id = ?
+        ORDER BY image.sort_order, image.id
         """,
         (hotel_id,),
     ).fetchall()
@@ -335,10 +337,11 @@ def _hotel_images(connection: sqlite3.Connection, hotel_id: str) -> list[dict[st
 def _room_images(connection: sqlite3.Connection, room_type_id: str) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
-        SELECT url, alt_text
-        FROM room_images
-        WHERE room_type_id = ?
-        ORDER BY sort_order, id
+        SELECT image.url, image.alt_text
+        FROM images AS image
+        JOIN room_images AS room_image ON room_image.image_id = image.id
+        WHERE room_image.room_type_id = ?
+        ORDER BY image.sort_order, image.id
         """,
         (room_type_id,),
     ).fetchall()
@@ -419,6 +422,7 @@ def _public_room_types(
         SELECT room_type.*
         FROM room_types AS room_type
         WHERE room_type.hotel_id = ?
+          AND room_type.status = 'active'
           AND room_type.capacity >= ?
           AND EXISTS (
             SELECT 1 FROM rooms AS room
