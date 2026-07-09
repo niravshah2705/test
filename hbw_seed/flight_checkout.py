@@ -16,7 +16,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Mapping
 
 from .flight_search import DEFAULT_NOW, _baggage_summary, _is_expired
-from .flights import DeterministicMockFlightProvider, FlightBookingService, FlightOffer, FlightProvider, FlightProviderTimeout, FlightProviderUnavailable, RevalidationResult
+from .flights import DeterministicMockFlightProvider, FlightBookingService, FlightOffer, FlightOrderRequest, FlightProvider, FlightProviderTimeout, FlightProviderUnavailable, RevalidationResult
 from .profiles import ProfileRepository, ProfileValidationError
 from .public_api import ApiResponse, error_response, success_response
 
@@ -26,6 +26,9 @@ PHONE_RE = re.compile(r"^\+?[0-9][0-9 .()\-]{6,24}$")
 COUNTRY_RE = re.compile(r"^[A-Z]{2}$")
 DOCUMENT_TYPES = {"passport", "national_id"}
 GENDERS = {"female", "male", "non_binary", "unspecified"}
+PAYMENT_TOKEN_RE = re.compile(r"^(tok|pm|ref)_[A-Za-z0-9_\-]{8,80}$")
+IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9_.:-]{8,120}$")
+SENSITIVE_PAYMENT_FIELDS = {"cardNumber", "card_number", "cvv", "cvc", "pan", "expiry", "expiration", "card"}
 PASSENGER_TYPES = {"adult", "child", "infant"}
 AIRPORT_COUNTRIES = {"SFO": "US", "JFK": "US", "LAX": "US", "ORD": "US", "SEA": "US", "LHR": "GB", "YYZ": "CA"}
 DEFAULT_TAX_RATE = 0.12
@@ -125,6 +128,8 @@ class BookingDraftRepository:
             "passengerSnapshots": [_snapshot_payload(row) for row in passengers],
             "revalidation": _parse_snapshot(draft["revalidation_snapshot"]) if "revalidation_snapshot" in draft.keys() else None,
             "paymentAllowed": draft["status"] in {"price_validated", "price_change_accepted"},
+            "paymentAttempts": _parse_snapshot(draft["payment_attempts"]) if "payment_attempts" in draft.keys() else [],
+            "providerOrder": _parse_snapshot(draft["provider_order"]) if "provider_order" in draft.keys() else None,
         }
 
     def update(self, draft_id: str, changes: Mapping[str, Any]) -> dict[str, Any] | None:
@@ -137,9 +142,19 @@ class BookingDraftRepository:
             status = changes.get("status", current["status"])
             total = changes.get("total") or {"amountCents": current["total_cents"], "currency": current["currency"]}
             revalidation = changes.get("revalidation")
+            payment_attempts = changes.get("paymentAttempts")
+            provider_order = changes.get("providerOrder")
             connection.execute(
-                "UPDATE flight_booking_drafts SET status = ?, total_cents = ?, currency = ?, revalidation_snapshot = ? WHERE id = ?",
-                (status, int(total["amountCents"]), total["currency"], repr(revalidation) if revalidation is not None else current["revalidation_snapshot"], draft_id),
+                "UPDATE flight_booking_drafts SET status = ?, total_cents = ?, currency = ?, revalidation_snapshot = ?, payment_attempts = ?, provider_order = ? WHERE id = ?",
+                (
+                    status,
+                    int(total["amountCents"]),
+                    total["currency"],
+                    repr(revalidation) if revalidation is not None else current["revalidation_snapshot"],
+                    repr(payment_attempts) if payment_attempts is not None else current["payment_attempts"],
+                    repr(provider_order) if provider_order is not None else current["provider_order"],
+                    draft_id,
+                ),
             )
             connection.commit()
         return self.get(draft_id)
@@ -315,6 +330,8 @@ def create_booking_draft(
         "total": detail["fareSummary"]["total"],
         "offerSnapshot": detail,
         "passengerSnapshots": snapshots,
+        "paymentAttempts": [],
+        "providerOrder": None,
     }
     return (repository or InMemoryBookingDraftRepository()).save(draft)
 
@@ -380,6 +397,124 @@ def booking_review_payload(draft: dict[str, Any]) -> dict[str, Any]:
     if revalidation.get("status") in {"retryable_failure", "not_started"}:
         actions.append({"label": "Retry price check", "action": "revalidate", "variant": "primary"})
     return {"draftId": draft["id"], "status": draft["status"], "paymentAllowed": payment_allowed, "currentTotal": draft["total"], "revalidation": revalidation, "actions": actions}
+
+
+def finalize_booking_payment(
+    draft_id: str,
+    payload: Mapping[str, Any],
+    *,
+    repository: InMemoryBookingDraftRepository | BookingDraftRepository,
+    provider: FlightProvider | None = None,
+) -> dict[str, Any]:
+    """Authorize tokenized payment and create the provider booking exactly once per idempotency key."""
+
+    draft = repository.get(draft_id)
+    if draft is None:
+        raise CheckoutValidationError({"draftId": ["Booking draft was not found."]})
+    validation = _validate_payment_payload(draft, payload)
+    if validation["errors"]:
+        attempt = _payment_attempt(draft, validation["idempotencyKey"], validation["paymentToken"], "failed", "validation_failed")
+        updated = _append_payment_attempt(repository, draft, attempt)
+        raise CheckoutValidationError(validation["errors"])
+
+    idempotency_key = validation["idempotencyKey"]
+    existing = _attempt_by_idempotency(draft, idempotency_key)
+    if existing:
+        return _confirmation_payload(draft, existing, duplicate=True)
+
+    if draft["status"] in {"finalized", "ticketing_pending"}:
+        completed = _latest_terminal_attempt(draft)
+        if completed:
+            return _confirmation_payload(draft, completed, duplicate=True)
+        raise CheckoutValidationError({"status": ["Booking is already finalized."]})
+
+    if draft["status"] not in {"price_validated", "price_change_accepted"}:
+        raise CheckoutValidationError({"revalidation": ["Successful price revalidation is required before payment."]})
+
+    amount = {"amountCents": int(payload.get("amountCents")), "currency": str(payload.get("currency") or "").upper()}
+    if amount["amountCents"] != draft["total"]["amountCents"] or amount["currency"] != draft["total"]["currency"]:
+        attempt = _payment_attempt(draft, idempotency_key, validation["paymentToken"], "failed", "amount_or_currency_mismatch")
+        updated = _append_payment_attempt(repository, draft, attempt)
+        raise CheckoutValidationError({"amount": ["Payment amount and currency must match the accepted revalidated price."]})
+
+    scenario = str(payload.get("scenario") or "success")
+    payment_attempt = _payment_attempt(draft, idempotency_key, validation["paymentToken"], "authorized", None)
+    if scenario == "declined":
+        payment_attempt["status"] = "declined"
+        payment_attempt["failureReason"] = "payment_declined"
+        updated = _append_payment_attempt(repository, draft, payment_attempt)
+        return _confirmation_payload(updated, payment_attempt)
+
+    draft_with_payment = _append_payment_attempt(repository, draft, payment_attempt)
+    try:
+        order = FlightBookingService(provider or DeterministicMockFlightProvider()).createOrder(
+            FlightOrderRequest(
+                offer_id=draft["offerId"],
+                passengers=tuple(draft.get("passengerSnapshots") or ()),
+                contact_email=draft["contact"]["email"],
+                scenario="error" if scenario == "provider_failure" else "success",
+            )
+        )
+    except (FlightProviderTimeout, FlightProviderUnavailable) as exc:
+        failed_attempt = {**payment_attempt, "status": "authorized_booking_failed", "failureReason": "provider_booking_failed"}
+        updated = repository.update(
+            draft_id,
+            {
+                "status": "ticketing_pending",
+                "paymentAttempts": _replace_attempt(draft_with_payment.get("paymentAttempts") or [], failed_attempt),
+                "providerOrder": {"status": "failed", "message": str(exc)},
+            },
+        )
+        return _confirmation_payload(updated or draft_with_payment, failed_attempt)
+
+    provider_order = order.to_payload()
+    final_status = "finalized" if order.status == "ticketed" else "ticketing_pending"
+    captured_attempt = {**payment_attempt, "status": "captured"}
+    updated = repository.update(
+        draft_id,
+        {
+            "status": final_status,
+            "paymentAttempts": _replace_attempt(draft_with_payment.get("paymentAttempts") or [], captured_attempt),
+            "providerOrder": provider_order,
+        },
+    )
+    return _confirmation_payload(updated or draft_with_payment, captured_attempt)
+
+
+def poll_booking_finalization(
+    draft_id: str,
+    *,
+    repository: InMemoryBookingDraftRepository | BookingDraftRepository,
+    provider: FlightProvider | None = None,
+) -> dict[str, Any]:
+    draft = repository.get(draft_id)
+    if draft is None:
+        raise CheckoutValidationError({"draftId": ["Booking draft was not found."]})
+    order = draft.get("providerOrder")
+    attempt = _latest_terminal_attempt(draft)
+    if not order or order.get("status") != "ticketing_pending":
+        return _confirmation_payload(draft, attempt)
+    latest = FlightBookingService(provider or DeterministicMockFlightProvider()).getOrderStatus(order["id"])
+    updated_order = latest.to_payload()
+    status = "finalized" if latest.status == "ticketed" else "ticketing_pending"
+    updated = repository.update(draft_id, {"status": status, "providerOrder": updated_order})
+    return _confirmation_payload(updated or draft, attempt)
+
+
+def handle_finalize_booking_payment(draft_id: str, payload: Mapping[str, Any], **kwargs: Any) -> ApiResponse:
+    try:
+        result = finalize_booking_payment(draft_id, payload, **kwargs)
+    except CheckoutValidationError as exc:
+        return error_response(400, "validation_error", "Payment could not be finalized.", fields=exc.fields)
+    status_code = 202 if result["status"] in {"ticketing_pending", "payment_declined", "booking_failed_after_payment"} else 200
+    return success_response(result, status_code=status_code)
+
+
+def handle_poll_booking_finalization(draft_id: str, **kwargs: Any) -> ApiResponse:
+    try:
+        return success_response(poll_booking_finalization(draft_id, **kwargs))
+    except CheckoutValidationError as exc:
+        return error_response(400, "validation_error", "Booking status could not be retrieved.", fields=exc.fields)
 
 
 def handle_revalidate_booking_draft(draft_id: str, **kwargs: Any) -> ApiResponse:
@@ -468,6 +603,101 @@ def _parse_snapshot(raw: Any) -> Any:
     return raw
 
 
+
+def _validate_payment_payload(draft: dict[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
+    errors: dict[str, list[str]] = {}
+    for field in SENSITIVE_PAYMENT_FIELDS:
+        if field in payload:
+            errors[field] = ["Raw card data must be entered only in provider-hosted tokenized fields."]
+    if str(payload.get("bookingId") or payload.get("draftId") or "") != draft["id"]:
+        errors["bookingId"] = ["bookingId must match the booking being paid."]
+    token = str(payload.get("paymentToken") or payload.get("paymentReference") or "").strip()
+    if not PAYMENT_TOKEN_RE.fullmatch(token):
+        errors["paymentToken"] = ["A provider token/reference is required."]
+    idempotency_key = str(payload.get("idempotencyKey") or "").strip()
+    if not IDEMPOTENCY_KEY_RE.fullmatch(idempotency_key):
+        errors["idempotencyKey"] = ["A stable idempotency key is required."]
+    try:
+        int(payload.get("amountCents"))
+    except Exception:
+        errors["amountCents"] = ["Payment amount is required in cents."]
+    if not str(payload.get("currency") or "").strip():
+        errors["currency"] = ["Payment currency is required."]
+    return {"errors": errors, "paymentToken": token, "idempotencyKey": idempotency_key}
+
+
+def _payment_attempt(draft: dict[str, Any], idempotency_key: str, payment_token: str, status: str, failure_reason: str | None) -> dict[str, Any]:
+    suffix = re.sub(r"[^A-Za-z0-9]+", "_", idempotency_key).strip("_")[:40]
+    attempt = {
+        "id": f"pay_{draft['id']}_{suffix}",
+        "bookingId": draft["id"],
+        "status": status,
+        "amount": draft["total"],
+        "idempotencyKey": idempotency_key,
+        "paymentReference": f"{payment_token.split('_', 1)[0]}_***{payment_token[-4:]}",
+    }
+    if failure_reason:
+        attempt["failureReason"] = failure_reason
+    return attempt
+
+
+def _append_payment_attempt(repository: InMemoryBookingDraftRepository | BookingDraftRepository, draft: dict[str, Any], attempt: dict[str, Any]) -> dict[str, Any]:
+    attempts = list(draft.get("paymentAttempts") or [])
+    attempts.append(attempt)
+    return repository.update(draft["id"], {"paymentAttempts": attempts}) or {**draft, "paymentAttempts": attempts}
+
+
+def _attempt_by_idempotency(draft: dict[str, Any], idempotency_key: str) -> dict[str, Any] | None:
+    return next((attempt for attempt in draft.get("paymentAttempts") or [] if attempt.get("idempotencyKey") == idempotency_key), None)
+
+
+def _replace_attempt(attempts: list[dict[str, Any]], replacement: dict[str, Any]) -> list[dict[str, Any]]:
+    replaced = False
+    result = []
+    for attempt in attempts:
+        if attempt.get("id") == replacement.get("id"):
+            result.append(replacement)
+            replaced = True
+        else:
+            result.append(attempt)
+    if not replaced:
+        result.append(replacement)
+    return result
+
+
+def _latest_terminal_attempt(draft: dict[str, Any]) -> dict[str, Any] | None:
+    attempts = list(draft.get("paymentAttempts") or [])
+    return attempts[-1] if attempts else None
+
+
+def _confirmation_payload(draft: dict[str, Any], attempt: dict[str, Any] | None, *, duplicate: bool = False) -> dict[str, Any]:
+    order = draft.get("providerOrder")
+    payment_status = attempt.get("status") if attempt else "not_started"
+    if payment_status == "declined":
+        status = "payment_declined"
+    elif payment_status == "authorized_booking_failed":
+        status = "booking_failed_after_payment"
+    elif draft.get("status") == "finalized":
+        status = "confirmed"
+    elif draft.get("status") == "ticketing_pending":
+        status = "ticketing_pending"
+    else:
+        status = draft.get("status", "pending")
+    return {
+        "bookingId": draft["id"],
+        "status": status,
+        "duplicate": duplicate,
+        "payment": {
+            "id": attempt.get("id") if attempt else None,
+            "status": payment_status,
+            "amount": attempt.get("amount") if attempt else draft["total"],
+        },
+        "order": order,
+        "contact": {"email": draft["contact"]["email"]},
+        "itineraries": draft["offerSnapshot"].get("itineraries", []),
+        "passengers": [{"name": passenger["legalName"]["fullName"], "passengerType": passenger["passengerType"]} for passenger in draft.get("passengerSnapshots") or []],
+        "polling": {"enabled": status == "ticketing_pending", "href": f"/api/payments?bookingId={draft['id']}"},
+    }
 
 def _validate_contact(raw: Mapping[str, Any], errors: dict[str, list[str]]) -> dict[str, str]:
     email = str(raw.get("email") or "").strip().lower()
@@ -677,18 +907,21 @@ def _ensure_schema(connection: sqlite3.Connection) -> None:
             contact_phone TEXT NOT NULL,
             total_cents INTEGER NOT NULL,
             currency TEXT NOT NULL,
-            status TEXT NOT NULL CHECK (status IN ('draft', 'submitted', 'expired', 'revalidating', 'price_validated', 'price_changed', 'price_change_accepted', 'unavailable', 'revalidation_failed')),
+            status TEXT NOT NULL CHECK (status IN ('draft', 'submitted', 'expired', 'revalidating', 'price_validated', 'price_changed', 'price_change_accepted', 'unavailable', 'revalidation_failed', 'ticketing_pending', 'finalized')),
             created_at TEXT NOT NULL,
             expires_at TEXT NOT NULL,
             offer_snapshot TEXT NOT NULL,
-            revalidation_snapshot TEXT
+            revalidation_snapshot TEXT,
+            payment_attempts TEXT,
+            provider_order TEXT
         )
         """
     )
-    try:
-        connection.execute("ALTER TABLE flight_booking_drafts ADD COLUMN revalidation_snapshot TEXT")
-    except sqlite3.OperationalError:
-        pass
+    for column in ("revalidation_snapshot TEXT", "payment_attempts TEXT", "provider_order TEXT"):
+        try:
+            connection.execute(f"ALTER TABLE flight_booking_drafts ADD COLUMN {column}")
+        except sqlite3.OperationalError:
+            pass
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS flight_booking_passenger_snapshots (
