@@ -12,6 +12,9 @@ import re
 import sqlite3
 from dataclasses import dataclass
 from datetime import date
+
+from .occupancy import MAX_GUESTS
+from .stay import MAX_STAY_NIGHTS
 from math import ceil
 from typing import Any
 from urllib.parse import parse_qs
@@ -21,7 +24,6 @@ from .dto import public_hotel_detail_dto, public_hotel_summary_dto, public_room_
 MAX_PAGE_SIZE = 50
 DEFAULT_PAGE = 1
 DEFAULT_PAGE_SIZE = 20
-MAX_GUESTS = 12
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
@@ -233,8 +235,12 @@ def _validate_stay_and_occupancy(query: dict[str, str], *, require_destination: 
     check_out_raw = (query.get("checkOut") or "").strip()
     check_in = _parse_date(check_in_raw, "checkIn", errors)
     check_out = _parse_date(check_out_raw, "checkOut", errors)
-    if check_in and check_out and check_out <= check_in:
-        errors.setdefault("checkOut", []).append("Must be after checkIn.")
+    if check_in and check_out:
+        nights = check_out.toordinal() - check_in.toordinal()
+        if nights <= 0:
+            errors.setdefault("checkOut", []).append("Must be after checkIn.")
+        elif nights > MAX_STAY_NIGHTS:
+            errors.setdefault("checkOut", []).append(f"Stay cannot exceed {MAX_STAY_NIGHTS} nights.")
 
     adults, adult_errors = _positive_int(query.get("adults", "1"), "adults", minimum=1)
     if adult_errors:
@@ -446,7 +452,7 @@ def _available_room_count(
               AND block.ends_on > ?
               AND (
                 block.block_type = 'hotel_closure'
-                OR block.room_type_id = ?
+                OR (block.block_type = 'room_type_closure' AND block.room_type_id = ?)
                 OR block.room_id = room.id
               )
           )

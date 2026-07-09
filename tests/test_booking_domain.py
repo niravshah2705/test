@@ -13,6 +13,7 @@ from hbw_seed.booking import (
     admin_update_room,
     admin_update_room_type,
     available_room_ids,
+    overlapping_availability_blocks,
     booking_api_cancel_reservation,
     booking_api_create_reservation,
     booking_api_admin_cancel_reservation,
@@ -34,7 +35,10 @@ from hbw_seed.booking import (
     record_payment_webhook,
     validate_occupancy,
 )
+from hbw_seed.money import add_money, compare_money, format_money as shared_format_money, money, multiply_money, subtract_money
+from hbw_seed.occupancy import validate_occupancy as shared_validate_occupancy
 from hbw_seed.public_api import handle_get
+from hbw_seed.stay import MAX_STAY_NIGHTS, format_date_only, night_count, ranges_overlap, stay_payload
 
 
 def seeded_database(tmp_path):
@@ -212,6 +216,113 @@ def test_admin_inventory_actions_create_blocking_audit_records(tmp_path):
     assert all("blocking for admin inventory mutations" in audit_metadata(row).get("auditWritePolicy", "") for row in rows if row["entity_id"] in {"htl_sfo_garden", "rt_garden_family", "room_garden_family_302", "blk_audit_admin"})
 
 
+
+def test_availability_block_persistence_has_creator_timestamps_and_query_indexes(tmp_path):
+    database = seeded_database(tmp_path)
+
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        columns = {row["name"] for row in connection.execute("PRAGMA table_info(availability_blocks)").fetchall()}
+        indexes = {row["name"] for row in connection.execute("PRAGMA index_list(availability_blocks)").fetchall()}
+        block = connection.execute("SELECT * FROM availability_blocks WHERE id = 'blk_loft_hotel_closed'").fetchone()
+
+    assert {"hotel_id", "room_type_id", "room_id", "starts_on", "ends_on", "reason", "created_by_admin_user_id", "created_at", "updated_at"} <= columns
+    assert {
+        "idx_availability_blocks_hotel_dates",
+        "idx_availability_blocks_room_type_dates",
+        "idx_availability_blocks_room_dates",
+    } <= indexes
+    assert block["created_by_admin_user_id"] == "usr_admin"
+    assert block["created_at"] == "2031-03-01T00:01:00Z"
+    assert block["updated_at"] == "2031-03-01T00:01:00Z"
+
+
+def test_hotel_level_availability_block_makes_all_inventory_unavailable(tmp_path):
+    database = seeded_database(tmp_path)
+
+    assert admin_create_availability_block(
+        str(database),
+        block_id="blk_garden_all_closed",
+        hotel_id="htl_sfo_garden",
+        user_id="usr_admin",
+        block_type="hotel_closure",
+        starts_on="2031-06-12",
+        ends_on="2031-06-14",
+        reason="Full property maintenance.",
+    )["created_by_admin_user_id"] == "usr_admin"
+
+    with sqlite3.connect(database) as connection:
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-12", "2031-06-14") == []
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_queen", "2031-06-12", "2031-06-14") == []
+
+
+def test_room_type_availability_block_only_closes_target_room_type(tmp_path):
+    database = seeded_database(tmp_path)
+
+    admin_create_availability_block(
+        str(database),
+        block_id="blk_family_type_closed",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_admin",
+        block_type="room_type_closure",
+        starts_on="2031-06-12",
+        ends_on="2031-06-14",
+        reason="Family studio carpet replacement.",
+    )
+
+    with sqlite3.connect(database) as connection:
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-12", "2031-06-14") == []
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_queen", "2031-06-12", "2031-06-14") == [
+            "room_garden_queen_201",
+            "room_garden_queen_202",
+        ]
+
+
+def test_room_level_availability_block_reduces_physical_room_count_by_one(tmp_path):
+    database = seeded_database(tmp_path)
+
+    block = admin_create_availability_block(
+        str(database),
+        block_id="blk_family_302_maint",
+        hotel_id="htl_sfo_garden",
+        room_id="room_garden_family_302",
+        user_id="usr_admin",
+        block_type="room_maintenance",
+        starts_on="2031-06-12",
+        ends_on="2031-06-14",
+        reason="AC maintenance in one physical room.",
+    )
+
+    assert block["room_type_id"] == "rt_garden_family"
+    with sqlite3.connect(database) as connection:
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_family", "2031-06-12", "2031-06-14") == ["room_garden_family_301"]
+        assert available_room_ids(connection, "htl_sfo_garden", "rt_garden_queen", "2031-06-12", "2031-06-14") == [
+            "room_garden_queen_201",
+            "room_garden_queen_202",
+        ]
+
+
+def test_availability_block_overlap_query_uses_inclusive_checkin_exclusive_checkout(tmp_path):
+    database = seeded_database(tmp_path)
+
+    with sqlite3.connect(database) as connection:
+        overlapping = overlapping_availability_blocks(connection, "htl_sfo_bay", "2031-06-10", "2031-06-11")
+        back_to_back = overlapping_availability_blocks(connection, "htl_sfo_bay", "2031-06-11", "2031-06-12")
+
+    assert [block["id"] for block in overlapping] == ["blk_bay_suite_maint"]
+    assert back_to_back == []
+
+
+def test_availability_block_validation_rejects_invalid_ranges_ambiguous_targets_and_non_admin(tmp_path):
+    database = seeded_database(tmp_path)
+
+    assert str(assert_raises(BookingValidationError, admin_create_availability_block, str(database), block_id="blk_bad_range", hotel_id="htl_sfo_garden", user_id="usr_admin", block_type="hotel_closure", starts_on="2031-06-14", ends_on="2031-06-14", reason="Bad range.")) == "check_out must be after check_in."
+    assert str(assert_raises(BookingValidationError, admin_create_availability_block, str(database), block_id="blk_ambiguous", hotel_id="htl_sfo_garden", user_id="usr_admin", block_type="hotel_closure", starts_on="2031-06-12", ends_on="2031-06-14", reason="Ambiguous.", room_type_id="rt_garden_family")) == "Hotel-level availability blocks must not include room type or room targets."
+    assert str(assert_raises(BookingValidationError, admin_create_availability_block, str(database), block_id="blk_missing_target", hotel_id="htl_sfo_garden", user_id="usr_admin", block_type="room_type_closure", starts_on="2031-06-12", ends_on="2031-06-14", reason="Missing target.")) == "Room-type availability blocks must target exactly one room type."
+    assert str(assert_raises(PermissionError, admin_create_availability_block, str(database), block_id="blk_guest", hotel_id="htl_sfo_garden", user_id="usr_guest", block_type="hotel_closure", starts_on="2031-06-12", ends_on="2031-06-14", reason="Guest attempt.")) == "Admin access required."
+    assert str(assert_raises(PermissionError, admin_delete_availability_block, str(database), block_id="blk_loft_hotel_closed", user_id="usr_guest")) == "Admin access required."
+
 def test_system_actor_supported_for_background_audit_events(tmp_path):
     database = seeded_database(tmp_path)
     with sqlite3.connect(database) as connection:
@@ -242,6 +353,50 @@ def test_unit_date_money_and_occupancy_utilities_validate_booking_rules():
     assert str(assert_raises(BookingValidationError, format_money, -1, "USD")) == "amount_cents must be non-negative."
     assert str(assert_raises(BookingValidationError, validate_occupancy, 0, 0, 2)) == "At least one adult is required."
     assert str(assert_raises(BookingValidationError, validate_occupancy, 2, 3, 4)) == "Guest count exceeds room capacity."
+
+
+def test_date_only_utilities_cover_leap_day_dst_max_stay_and_overlap_edges():
+    assert format_date_only("2032-02-29") == "2032-02-29"
+    assert stay_payload("2032-02-28", "2032-03-01") == {"checkIn": "2032-02-28", "checkOut": "2032-03-01", "nights": 2}
+    assert night_count("2031-03-08", "2031-03-10") == 2
+    assert night_count("2031-11-01", "2031-11-03") == 2
+    assert ranges_overlap("2031-06-10", "2031-06-12", "2031-06-11", "2031-06-13") is True
+    assert ranges_overlap("2031-06-10", "2031-06-12", "2031-06-12", "2031-06-14") is False
+
+    assert str(assert_raises(BookingValidationError, parse_stay_dates, "2031-06-10T00:00:00", "2031-06-12")) == "Dates must use YYYY-MM-DD format."
+    assert str(assert_raises(BookingValidationError, parse_stay_dates, "2031-06-10", "2031-06-10")) == "check_out must be after check_in."
+    assert str(assert_raises(BookingValidationError, parse_stay_dates, "2031-06-10", "2031-07-11")) == f"Stay cannot exceed {MAX_STAY_NIGHTS} nights."
+
+
+def test_shared_occupancy_utilities_reject_fractional_negative_and_capacity_mismatch():
+    occupancy = shared_validate_occupancy("2", "1", "4")
+    assert occupancy.total_guests == 3
+    assert occupancy.to_payload() == {"adults": 2, "children": 1, "totalGuests": 3, "roomCapacity": 4}
+
+    assert str(assert_raises(ValueError, shared_validate_occupancy, "1.5", 0, 2)) == "adults must be an integer."
+    assert str(assert_raises(ValueError, shared_validate_occupancy, 1, -1, 2)) == "Children cannot be negative."
+    assert str(assert_raises(ValueError, shared_validate_occupancy, 13, 0, 13)) == "Total guests must be less than or equal to 12."
+    assert str(assert_raises(ValueError, shared_validate_occupancy, 2, 2, 3)) == "Guest count exceeds room capacity."
+
+
+def test_integer_minor_unit_money_operations_formatting_and_currency_validation():
+    zero = money(0)
+    nightly = money(19999)
+    fees = money(501)
+    total = add_money(nightly, fees).add(zero)
+
+    assert total.amount_cents == 20500
+    assert total.to_payload() == {"amountCents": 20500, "currency": "USD", "formatted": "USD 205.00"}
+    assert multiply_money(nightly, 3).amount_cents == 59997
+    assert subtract_money(total, fees).amount_cents == nightly.amount_cents
+    assert compare_money(total, nightly) == 1
+    assert compare_money(nightly, total) == -1
+    assert compare_money(total, money(20500)) == 0
+    assert shared_format_money(1, "USD")["formatted"] == "USD 0.01"
+
+    assert str(assert_raises(ValueError, money, 10.5)) == "amount_minor must be an integer minor-unit amount."
+    assert str(assert_raises(ValueError, money, -1)) == "amount_minor must be non-negative."
+    assert str(assert_raises(ValueError, money, 100, "BTC")) == "Unsupported currency: BTC."
 
 
 def test_integration_availability_supports_back_to_back_and_filters_overlaps(tmp_path):

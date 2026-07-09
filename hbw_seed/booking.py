@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import secrets
 import sqlite3
-from dataclasses import dataclass
 from datetime import date
 from math import ceil
 from typing import Any
@@ -18,9 +17,11 @@ from typing import Any
 from .audit import actor_from_user, record_audit_event, system_actor, user_actor
 from .auth import canAdministerHotel, canCancelReservation, canPayReservation, canViewReservation
 from .dto import admin_reservation_dto, guest_reservation_dto, payment_safe_dto
+from .money import MoneyValidationError, format_money as _format_money, multiply_money, money
+from .occupancy import MAX_GUESTS, OccupancyValidationError, validate_occupancy as _validate_occupancy
 from .public_api import ApiResponse, error_response, success_response
+from .stay import StayDates, StayValidationError, parse_stay_dates as _parse_stay_dates
 
-MAX_GUESTS = 12
 HOLD_EXPIRES_AT = "2031-06-09T23:59:00Z"
 PAYMENT_PROVIDER = "fixture_gateway"
 ADMIN_MAX_PAGE_SIZE = 50
@@ -28,13 +29,6 @@ ADMIN_DEFAULT_PAGE = 1
 ADMIN_DEFAULT_PAGE_SIZE = 20
 CANCELLABLE_STATUSES = {"confirmed", "pending_payment"}
 
-
-
-@dataclass(frozen=True)
-class StayDates:
-    check_in: str
-    check_out: str
-    nights: int
 
 
 class BookingConflict(Exception):
@@ -49,47 +43,38 @@ def parse_stay_dates(check_in: str, check_out: str) -> StayDates:
     """Validate ISO stay dates and return the half-open night count."""
 
     try:
-        parsed_check_in = date.fromisoformat(check_in)
-        parsed_check_out = date.fromisoformat(check_out)
-    except ValueError as exc:
-        raise BookingValidationError("Dates must use YYYY-MM-DD format.") from exc
-    nights = (parsed_check_out - parsed_check_in).days
-    if nights <= 0:
-        raise BookingValidationError("check_out must be after check_in.")
-    return StayDates(check_in=check_in, check_out=check_out, nights=nights)
+        return _parse_stay_dates(check_in, check_out)
+    except StayValidationError as exc:
+        raise BookingValidationError(str(exc)) from exc
 
 
 def format_money(amount_cents: int, currency: str = "USD") -> dict[str, Any]:
     """Return the shared money shape used by API payload assertions."""
 
-    if amount_cents < 0:
-        raise BookingValidationError("amount_cents must be non-negative.")
-    if currency != currency.upper() or len(currency) != 3:
-        raise BookingValidationError("currency must be a three-letter uppercase code.")
-    return {"amountCents": amount_cents, "currency": currency, "formatted": f"{currency} {amount_cents / 100:.2f}"}
+    try:
+        return _format_money(amount_cents, currency)
+    except MoneyValidationError as exc:
+        message = str(exc).replace("amount_minor", "amount_cents")
+        raise BookingValidationError(message) from exc
 
 
 def validate_occupancy(adults: int, children: int, room_capacity: int) -> int:
     """Validate guest counts against platform and room capacity limits."""
 
-    if adults < 1:
-        raise BookingValidationError("At least one adult is required.")
-    if children < 0:
-        raise BookingValidationError("Children cannot be negative.")
-    guests = adults + children
-    if guests > MAX_GUESTS:
-        raise BookingValidationError(f"Total guests must be less than or equal to {MAX_GUESTS}.")
-    if guests > room_capacity:
-        raise BookingValidationError("Guest count exceeds room capacity.")
-    return guests
+    try:
+        return _validate_occupancy(adults, children, room_capacity).total_guests
+    except OccupancyValidationError as exc:
+        raise BookingValidationError(str(exc)) from exc
 
 
 def calculate_total_cents(nightly_rate_cents: int, check_in: str, check_out: str) -> int:
     """Calculate the deterministic reservation total for a stay."""
 
-    if nightly_rate_cents < 0:
-        raise BookingValidationError("nightly_rate_cents must be non-negative.")
-    return nightly_rate_cents * parse_stay_dates(check_in, check_out).nights
+    try:
+        return multiply_money(money(nightly_rate_cents), parse_stay_dates(check_in, check_out).nights).amount_cents
+    except MoneyValidationError as exc:
+        message = str(exc).replace("amount_minor", "nightly_rate_cents")
+        raise BookingValidationError(message) from exc
 
 
 def available_room_ids(
@@ -115,7 +100,7 @@ def available_room_ids(
               AND block.ends_on > ?
               AND (
                 block.block_type = 'hotel_closure'
-                OR block.room_type_id = ?
+                OR (block.block_type = 'room_type_closure' AND block.room_type_id = ?)
                 OR block.room_id = room.id
               )
           )
@@ -131,6 +116,30 @@ def available_room_ids(
         (room_type_id, hotel_id, check_out, check_in, room_type_id, check_out, check_in),
     ).fetchall()
     return [row[0] for row in rows]
+
+
+def overlapping_availability_blocks(
+    connection: sqlite3.Connection,
+    hotel_id: str,
+    starts_on: str,
+    ends_on: str,
+) -> list[dict[str, Any]]:
+    """Return blocks for a hotel whose half-open ranges overlap the requested dates."""
+
+    parse_stay_dates(starts_on, ends_on)
+    cursor = connection.execute(
+        """
+        SELECT *
+        FROM availability_blocks
+        WHERE hotel_id = ?
+          AND starts_on < ?
+          AND ends_on > ?
+        ORDER BY starts_on, id
+        """,
+        (hotel_id, ends_on, starts_on),
+    )
+    columns = [description[0] for description in cursor.description]
+    return [dict(zip(columns, row)) for row in cursor.fetchall()]
 
 
 def create_pending_reservation(
@@ -733,6 +742,47 @@ def admin_update_room(
     )
 
 
+def _validate_availability_block_target(
+    connection: sqlite3.Connection,
+    *,
+    hotel_id: str,
+    block_type: str,
+    room_type_id: str | None,
+    room_id: str | None,
+) -> tuple[str | None, str | None]:
+    if connection.execute("SELECT 1 FROM hotels WHERE id = ?", (hotel_id,)).fetchone() is None:
+        raise LookupError("Hotel not found.")
+    if block_type == "hotel_closure":
+        if room_type_id is not None or room_id is not None:
+            raise BookingValidationError("Hotel-level availability blocks must not include room type or room targets.")
+        return None, None
+    if block_type == "room_type_closure":
+        if room_type_id is None or room_id is not None:
+            raise BookingValidationError("Room-type availability blocks must target exactly one room type.")
+        room_type = connection.execute("SELECT * FROM room_types WHERE id = ? AND hotel_id = ?", (room_type_id, hotel_id)).fetchone()
+        if room_type is None:
+            raise LookupError("Room type not found for hotel.")
+        return room_type_id, None
+    if block_type == "room_maintenance":
+        if room_id is None:
+            raise BookingValidationError("Room-level availability blocks must target exactly one physical room.")
+        room = connection.execute(
+            """
+            SELECT room.id, room.room_type_id
+            FROM rooms AS room
+            JOIN room_types AS room_type ON room_type.id = room.room_type_id
+            WHERE room.id = ? AND room_type.hotel_id = ?
+            """,
+            (room_id, hotel_id),
+        ).fetchone()
+        if room is None:
+            raise LookupError("Room not found for hotel.")
+        if room_type_id is not None and room_type_id != room["room_type_id"]:
+            raise BookingValidationError("Room-level availability block room type must match the physical room.")
+        return room["room_type_id"], room_id
+    raise BookingValidationError("Availability block type is invalid.")
+
+
 def admin_create_availability_block(
     database_path: str,
     *,
@@ -747,7 +797,11 @@ def admin_create_availability_block(
     room_id: str | None = None,
     created_at: str = "2031-04-03T10:15:00Z",
 ) -> dict[str, Any]:
-    """Create an availability block with a blocking admin audit record."""
+    """Create an availability block with validated target/date semantics and admin audit."""
+
+    parse_stay_dates(starts_on, ends_on)
+    if not reason or not reason.strip():
+        raise BookingValidationError("Availability block reason is required.")
 
     with _connect(database_path) as connection:
         try:
@@ -755,9 +809,32 @@ def admin_create_availability_block(
             actor = _actor_by_id(connection, user_id)
             if not canAdministerHotel(actor, hotel_id):
                 raise PermissionError("Admin access required.")
+            resolved_room_type_id, resolved_room_id = _validate_availability_block_target(
+                connection,
+                hotel_id=hotel_id,
+                block_type=block_type,
+                room_type_id=room_type_id,
+                room_id=room_id,
+            )
             connection.execute(
-                "INSERT INTO availability_blocks VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (block_id, hotel_id, room_type_id, room_id, block_type, starts_on, ends_on, reason),
+                """
+                INSERT INTO availability_blocks
+                    (id, hotel_id, room_type_id, room_id, block_type, starts_on, ends_on, reason, created_by_admin_user_id, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    block_id,
+                    hotel_id,
+                    resolved_room_type_id,
+                    resolved_room_id,
+                    block_type,
+                    starts_on,
+                    ends_on,
+                    reason.strip(),
+                    user_id,
+                    created_at,
+                    created_at,
+                ),
             )
             record_audit_event(
                 connection,
@@ -767,19 +844,19 @@ def admin_create_availability_block(
                 entity_id=block_id,
                 metadata={
                     "hotelId": hotel_id,
-                    "roomTypeId": room_type_id,
-                    "roomId": room_id,
+                    "roomTypeId": resolved_room_type_id,
+                    "roomId": resolved_room_id,
                     "blockType": block_type,
                     "startsOn": starts_on,
                     "endsOn": ends_on,
-                    "reason": reason,
+                    "reason": reason.strip(),
                     "auditWritePolicy": "blocking for admin inventory mutations",
                 },
                 created_at=created_at,
                 block_on_failure=True,
             )
             connection.commit()
-            return dict(connection.execute("SELECT * FROM availability_blocks WHERE id = ?", (block_id,)).fetchone())
+            return _row_to_dict(connection.execute("SELECT * FROM availability_blocks WHERE id = ?", (block_id,)).fetchone())
         except Exception:
             if connection.in_transaction:
                 connection.rollback()
@@ -1212,6 +1289,10 @@ def _connect(database_path: str) -> sqlite3.Connection:
     connection = sqlite3.connect(database_path)
     connection.row_factory = sqlite3.Row
     return connection
+
+
+def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    return {key: row[key] for key in row.keys()}
 
 
 def _actor_by_id(connection: sqlite3.Connection, user_id: str | None) -> sqlite3.Row | None:

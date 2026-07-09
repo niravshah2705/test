@@ -11,13 +11,16 @@ from dataclasses import dataclass
 from datetime import date
 from html import escape
 from typing import Any
+
+from .money import format_money
+from .occupancy import MAX_GUESTS
+from .stay import MAX_STAY_NIGHTS, StayValidationError, night_count
 from urllib.parse import parse_qs, urlencode
 
 from .public_api import ApiResponse, error_response, get_hotel_availability, get_hotel_detail, success_response
 from .ui_contracts import build_form_contract
 
 BOOKING_ENTRY_PATH = "/booking/guest-details"
-MAX_GUESTS = 12
 
 
 @dataclass(frozen=True)
@@ -199,8 +202,12 @@ def _parse_page_query(query: dict[str, str]) -> dict[str, Any]:
     if has_date_query:
         check_in_date = _parse_date(check_in, "checkIn", errors)
         check_out_date = _parse_date(check_out, "checkOut", errors)
-        if check_in_date and check_out_date and check_out_date <= check_in_date:
-            errors.setdefault("checkOut", []).append("Must be after checkIn.")
+        if check_in_date and check_out_date:
+            nights = check_out_date.toordinal() - check_in_date.toordinal()
+            if nights <= 0:
+                errors.setdefault("checkOut", []).append("Must be after checkIn.")
+            elif nights > MAX_STAY_NIGHTS:
+                errors.setdefault("checkOut", []).append(f"Stay cannot exceed {MAX_STAY_NIGHTS} nights.")
     else:
         check_in_date = None
         check_out_date = None
@@ -274,7 +281,7 @@ def _room_card(hotel: dict[str, Any], room_type: dict[str, Any], stay: dict[str,
 
 
 def _money(amount_cents: int, currency: str) -> dict[str, Any]:
-    return {"amountCents": amount_cents, "currency": currency, "formatted": f"{currency} {amount_cents / 100:.2f}"}
+    return format_money(amount_cents, currency)
 
 
 def _availability_label(available_rooms: int) -> str:
@@ -315,7 +322,10 @@ def _shareable_url(slug: str, stay: dict[str, Any]) -> str:
 
 
 def _nights(check_in: str, check_out: str) -> int:
-    return (date.fromisoformat(check_out) - date.fromisoformat(check_in)).days
+    try:
+        return night_count(check_in, check_out)
+    except StayValidationError:
+        return 0
 
 
 def _bed_description(name: str, description: str) -> str:

@@ -4,8 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Mapping
 
+from .money import format_money
+
+
 def _format_money(amount_cents: int, currency: str = "USD") -> dict[str, Any]:
-    return {"amountCents": amount_cents, "currency": currency, "formatted": f"{currency} {amount_cents / 100:.2f}"}
+    return format_money(amount_cents, currency)
 
 
 def public_room_type_dto(row: Mapping[str, Any], *, images: list[dict[str, Any]], available_rooms: int) -> dict[str, Any]:
