@@ -1,14 +1,26 @@
+import json
 import sqlite3
 
 from hbw_seed import reset_and_seed
+from hbw_seed.auth import canAdministerHotel, canCancelReservation, canViewReservation
+from hbw_seed.audit import record_audit_event, sanitize_metadata, system_actor
 from hbw_seed.booking import (
     BookingConflict,
     BookingValidationError,
+    admin_create_availability_block,
+    admin_delete_availability_block,
+    admin_update_hotel,
+    admin_update_room,
+    admin_update_room_type,
     available_room_ids,
     booking_api_cancel_reservation,
     booking_api_create_reservation,
+    booking_api_admin_get_reservation,
+    booking_api_get_guest_reservation,
     booking_api_get_reservation,
+    booking_api_record_payment,
     calculate_total_cents,
+    create_payment_intent,
     cancel_reservation,
     create_pending_reservation,
     expire_pending_reservation,
@@ -27,12 +39,193 @@ def seeded_database(tmp_path):
     return database
 
 
+def audit_rows(database, entity_id=None):
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        sql = "SELECT * FROM audit_records"
+        params = []
+        if entity_id is not None:
+            sql += " WHERE entity_id = ?"
+            params.append(entity_id)
+        sql += " ORDER BY created_at, id"
+        return [dict(row) for row in connection.execute(sql, params).fetchall()]
+
+
+def audit_metadata(row):
+    return json.loads(row["metadata"])
+
+
 def assert_raises(expected_exception, function, *args, **kwargs):
     try:
         function(*args, **kwargs)
     except expected_exception as exc:
         return exc
     raise AssertionError(f"Expected {expected_exception.__name__}")
+
+
+def test_audit_service_records_actor_event_entity_metadata_timestamp_and_sanitizes():
+    metadata = sanitize_metadata(
+        {
+            "amountCents": 1000,
+            "cardNumber": "4242424242424242",
+            "nested": {"providerSecret": "secret", "kept": True},
+            "items": [{"token": "tok_secret", "safe": "value"}],
+        }
+    )
+
+    assert metadata == {"amountCents": 1000, "nested": {"kept": True}, "items": [{"safe": "value"}]}
+
+
+def test_reservation_payment_refund_cancellation_audits_and_duplicate_webhook_idempotency(tmp_path):
+    database = seeded_database(tmp_path)
+
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_audit_flow",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+    payment_intent = create_payment_intent(
+        str(database),
+        payment_id="pay_intent_audit",
+        reservation_id=reservation["id"],
+        user_id="usr_guest",
+        provider_reference="fx_intent_audit",
+    )
+    success = record_payment_webhook(
+        str(database),
+        provider_reference="fx_audit_success",
+        reservation_id=reservation["id"],
+        amount_cents=reservation["total"]["amountCents"],
+    )
+    duplicate = record_payment_webhook(
+        str(database),
+        provider_reference="fx_audit_success",
+        reservation_id=reservation["id"],
+        amount_cents=reservation["total"]["amountCents"],
+    )
+    cancelled = cancel_reservation(str(database), reservation_id=reservation["id"], user_id="usr_guest")
+
+    assert payment_intent["status"] == "authorized"
+    assert success["duplicate"] is False
+    assert duplicate["duplicate"] is True
+    assert cancelled["status"] == "cancelled"
+
+    rows = audit_rows(database)
+    events = [(row["event_type"], row["entity_type"], row["entity_id"], row["actor_type"], row["actor_user_id"]) for row in rows]
+    assert ("reservation.created", "reservation", "res_audit_flow", "guest", "usr_guest") in events
+    assert ("payment_intent.created", "payment", "pay_intent_audit", "guest", "usr_guest") in events
+    assert ("reservation.confirmed", "reservation", "res_audit_flow", "webhook", None) in events
+    assert ("payment.succeeded", "payment", "pay_fx_audit_success", "webhook", None) in events
+    assert ("refund.created", "refund", "ref_pay_fx_audit_success", "guest", "usr_guest") in events
+    assert ("reservation.cancelled", "reservation", "res_audit_flow", "guest", "usr_guest") in events
+    assert sum(1 for row in rows if row["entity_id"] == "pay_fx_audit_success" and row["event_type"] == "payment.succeeded") == 1
+
+    payment_audit = next(row for row in rows if row["entity_id"] == "pay_fx_audit_success")
+    payment_metadata = audit_metadata(payment_audit)
+    assert payment_metadata["provider"] == "fixture_gateway"
+    assert payment_metadata["amountCents"] == reservation["total"]["amountCents"]
+    assert "providerReference" not in payment_metadata
+    assert "providerSecret" not in payment_metadata
+    assert "cardNumber" not in payment_metadata
+    assert "rawPayload" not in payment_metadata
+
+
+def test_payment_failure_audit_uses_webhook_actor_and_safe_metadata(tmp_path):
+    database = seeded_database(tmp_path)
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_audit_failure",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+
+    assert_raises(
+        BookingValidationError,
+        record_payment_webhook,
+        str(database),
+        provider_reference="fx_audit_failure",
+        reservation_id=reservation["id"],
+        amount_cents=reservation["total"]["amountCents"] - 1,
+    )
+
+    row = audit_rows(database, "pay_fx_audit_failure")[0]
+    metadata = audit_metadata(row)
+    assert row["actor_type"] == "webhook"
+    assert row["actor_user_id"] is None
+    assert row["event_type"] == "payment.failed"
+    assert metadata["failureReason"] == "amount_or_currency_mismatch"
+    assert "providerReference" not in metadata
+
+
+def test_admin_inventory_actions_create_blocking_audit_records(tmp_path):
+    database = seeded_database(tmp_path)
+
+    hotel = admin_update_hotel(str(database), hotel_id="htl_sfo_garden", user_id="usr_admin", changes={"description": "Updated fixture description."})
+    room_type = admin_update_room_type(str(database), room_type_id="rt_garden_family", user_id="usr_admin", changes={"nightly_rate_cents": 27000})
+    room = admin_update_room(str(database), room_id="room_garden_family_302", user_id="usr_admin", changes={"status": "maintenance"})
+    block = admin_create_availability_block(
+        str(database),
+        block_id="blk_audit_admin",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        room_id=None,
+        user_id="usr_admin",
+        block_type="room_type_closure",
+        starts_on="2031-06-20",
+        ends_on="2031-06-21",
+        reason="Fixture admin closure.",
+    )
+    deleted = admin_delete_availability_block(str(database), block_id="blk_audit_admin", user_id="usr_admin")
+
+    assert hotel["description"] == "Updated fixture description."
+    assert room_type["nightly_rate_cents"] == 27000
+    assert room["status"] == "maintenance"
+    assert block["id"] == "blk_audit_admin"
+    assert deleted is True
+
+    rows = audit_rows(database)
+    events = {(row["event_type"], row["entity_id"], row["actor_type"], row["actor_user_id"]) for row in rows}
+    assert ("hotel.updated", "htl_sfo_garden", "admin", "usr_admin") in events
+    assert ("room_type.updated", "rt_garden_family", "admin", "usr_admin") in events
+    assert ("room.updated", "room_garden_family_302", "admin", "usr_admin") in events
+    assert ("availability_block.created", "blk_audit_admin", "admin", "usr_admin") in events
+    assert ("availability_block.deleted", "blk_audit_admin", "admin", "usr_admin") in events
+    assert all("blocking for admin inventory mutations" in audit_metadata(row).get("auditWritePolicy", "") for row in rows if row["entity_id"] in {"htl_sfo_garden", "rt_garden_family", "room_garden_family_302", "blk_audit_admin"})
+
+
+def test_system_actor_supported_for_background_audit_events(tmp_path):
+    database = seeded_database(tmp_path)
+    with sqlite3.connect(database) as connection:
+        record_audit_event(
+            connection,
+            actor=system_actor(),
+            event_type="reservation.expired",
+            entity_type="reservation",
+            entity_id="res_garden_family_pending",
+            metadata={"auditWritePolicy": "best effort; expiration correctness wins"},
+            created_at="2031-06-10T00:00:00Z",
+        )
+        connection.commit()
+
+    row = audit_rows(database, "res_garden_family_pending")[0]
+    assert row["actor_type"] == "system"
+    assert row["actor_user_id"] is None
+    assert row["event_type"] == "reservation.expired"
 
 
 def test_unit_date_money_and_occupancy_utilities_validate_booking_rules():
@@ -80,7 +273,8 @@ def test_reservation_creation_is_transactional_for_last_room_and_duplicate_reque
         children=1,
     )
     assert first["status"] == "pending_payment"
-    assert first["roomId"] == "room_garden_family_302"
+    assert "roomId" not in first
+    assert "userId" not in first
     assert first["total"] == {"amountCents": 52000, "currency": "USD", "formatted": "USD 520.00"}
 
     duplicate = create_pending_reservation(
@@ -97,7 +291,7 @@ def test_reservation_creation_is_transactional_for_last_room_and_duplicate_reque
         children=1,
     )
     assert duplicate["duplicateRequest"] is True
-    assert duplicate["roomId"] == first["roomId"]
+    assert "roomId" not in duplicate
 
     assert str(
         assert_raises(
@@ -225,8 +419,8 @@ def test_authorization_prevents_viewing_or_cancelling_another_users_booking(tmp_
     database = seeded_database(tmp_path)
 
     assert get_reservation_for_user(str(database), "res_bay_king_auth_confirmed", "usr_guest")["id"] == "res_bay_king_auth_confirmed"
-    assert str(assert_raises(PermissionError, get_reservation_for_user, str(database), "res_bay_king_auth_confirmed", "usr_admin")) == "Reservation belongs to another user."
-    assert str(assert_raises(PermissionError, cancel_reservation, str(database), reservation_id="res_bay_king_auth_confirmed", user_id="usr_admin")) == "Reservation belongs to another user."
+    assert str(assert_raises(PermissionError, get_reservation_for_user, str(database), "res_bay_king_auth_confirmed", "usr_admin")) == "Reservation access denied."
+    assert str(assert_raises(PermissionError, cancel_reservation, str(database), reservation_id="res_bay_king_auth_confirmed", user_id="usr_admin")) == "Reservation access denied."
 
 
 def test_api_response_contracts_for_success_validation_conflict_and_forbidden(tmp_path):
@@ -276,7 +470,7 @@ def test_api_response_contracts_for_success_validation_conflict_and_forbidden(tm
     assert duplicate.status_code == 200
     assert duplicate.body["data"]["duplicateRequest"] is True
     assert forbidden.status_code == 403
-    assert forbidden.body == {"success": False, "data": None, "error": {"code": "forbidden", "message": "Reservation belongs to another user."}}
+    assert forbidden.body == {"success": False, "data": None, "error": {"code": "forbidden", "message": "You are not authorized to access this reservation."}}
 
     conflict = booking_api_create_reservation(
         str(database),
@@ -352,3 +546,79 @@ def test_e2e_guest_search_select_pay_confirm_view_and_cancel_flow(tmp_path):
     assert cancellation.status_code == 200
     assert cancellation.body["data"]["status"] == "cancelled"
     assert cancellation.body["data"]["refund"]["status"] == "succeeded"
+
+
+def test_explicit_authorization_helpers_cover_guest_and_admin_rules(tmp_path):
+    database = seeded_database(tmp_path)
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        guest = connection.execute("SELECT * FROM users WHERE id = 'usr_guest'").fetchone()
+        admin = connection.execute("SELECT * FROM users WHERE id = 'usr_admin'").fetchone()
+        reservation = connection.execute("SELECT * FROM reservations WHERE id = 'res_bay_king_auth_confirmed'").fetchone()
+
+    assert canViewReservation(guest, reservation) is True
+    assert canCancelReservation(guest, reservation) is True
+    assert canViewReservation(None, reservation) is False
+    assert canCancelReservation(admin, reservation) is False
+    assert canAdministerHotel(admin, reservation["hotel_id"]) is True
+    assert canAdministerHotel(guest, reservation["hotel_id"]) is False
+
+
+def test_guest_confirmation_lookup_requires_non_guessable_secret(tmp_path):
+    database = seeded_database(tmp_path)
+
+    guessed = booking_api_get_guest_reservation(str(database), "res_bay_king_guest_confirmed", "0001")
+    valid = booking_api_get_guest_reservation(str(database), "res_bay_king_guest_confirmed", "cnf_9e45f6c9baf04c2c8d3f1a72")
+
+    assert guessed.status_code == 404
+    assert valid.status_code == 200
+    assert valid.body["data"]["id"] == "res_bay_king_guest_confirmed"
+    assert "roomId" not in valid.body["data"]
+    assert "userId" not in valid.body["data"]
+
+
+def test_payment_api_authorizes_owner_and_hides_provider_reference(tmp_path):
+    database = seeded_database(tmp_path)
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_payment_authz",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+
+    unauthorized = booking_api_record_payment(
+        str(database),
+        {"reservationId": reservation["id"], "providerReference": "fx_forbidden", "amountCents": reservation["total"]["amountCents"]},
+        "usr_admin",
+    )
+    authorized = booking_api_record_payment(
+        str(database),
+        {"reservationId": reservation["id"], "providerReference": "fx_payment_authz", "amountCents": reservation["total"]["amountCents"]},
+        "usr_guest",
+    )
+
+    assert unauthorized.status_code == 403
+    assert authorized.status_code == 201
+    assert authorized.body["data"]["payment"]["status"] == "captured"
+    assert "providerReference" not in authorized.body["data"]["payment"]
+    assert "providerSecret" not in authorized.body["data"]["payment"]
+
+
+def test_admin_endpoint_rejects_non_admin_and_returns_operational_dto_only_to_admin(tmp_path):
+    database = seeded_database(tmp_path)
+
+    rejected = booking_api_admin_get_reservation(str(database), "res_bay_king_auth_confirmed", "usr_guest")
+    accepted = booking_api_admin_get_reservation(str(database), "res_bay_king_auth_confirmed", "usr_admin")
+
+    assert rejected.status_code == 403
+    assert rejected.body["error"] == {"code": "forbidden", "message": "Admin access required."}
+    assert accepted.status_code == 200
+    assert accepted.body["data"]["roomId"] == "room_bay_king_502"
+    assert accepted.body["data"]["userId"] == "usr_guest"
