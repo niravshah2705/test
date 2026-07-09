@@ -14,6 +14,8 @@ from hbw_seed.booking import (
     admin_update_room_type,
     available_room_ids,
     booking_api_cancel_reservation,
+    booking_api_get_booking_draft,
+    booking_api_submit_booking_details,
     booking_api_create_reservation,
     booking_api_admin_cancel_reservation,
     booking_api_admin_get_reservation,
@@ -22,6 +24,16 @@ from hbw_seed.booking import (
     booking_api_admin_update_reservation_status,
     booking_api_get_guest_reservation,
     booking_api_get_reservation,
+    booking_api_get_account_reservations,
+    booking_api_get_reservation_view,
+    booking_api_get_admin_inventory_screen,
+    booking_api_admin_create_hotel,
+    booking_api_admin_create_room_type,
+    booking_api_admin_create_room,
+    booking_api_admin_create_availability_block,
+    booking_api_admin_update_hotel,
+    booking_api_admin_update_room_type,
+    booking_api_admin_update_room,
     booking_api_record_payment,
     calculate_total_cents,
     create_payment_intent,
@@ -174,6 +186,116 @@ def test_payment_failure_audit_uses_webhook_actor_and_safe_metadata(tmp_path):
     assert row["event_type"] == "payment.failed"
     assert metadata["failureReason"] == "amount_or_currency_mismatch"
     assert "providerReference" not in metadata
+
+
+def test_reservation_screen_view_models_enforce_ownership_and_safe_guest_lookup(tmp_path):
+    database = seeded_database(tmp_path)
+
+    pending = booking_api_get_reservation_view(str(database), "res_garden_family_pending", user_id="usr_guest")
+    account = booking_api_get_account_reservations(str(database), user_id="usr_guest")
+    detail = booking_api_get_reservation(str(database), "res_garden_family_pending", user_id="usr_guest")
+    other_user = booking_api_get_reservation_view(str(database), "res_garden_family_pending", user_id="usr_other")
+
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        guest_row = connection.execute("SELECT id, confirmation_secret FROM reservations WHERE id = 'res_loft_guest_confirmed'").fetchone()
+    guest_confirmation = booking_api_get_reservation_view(str(database), guest_row["id"], confirmation_secret=guest_row["confirmation_secret"])
+    guessed_guest = booking_api_get_reservation_view(str(database), guest_row["id"], confirmation_secret="res_loft_guest_confirmed")
+
+    assert pending.status_code == 200
+    assert pending.body["data"]["confirmationCode"] == "res_garden_family_pending"
+    assert pending.body["data"]["reservationStatus"] == "pending_payment"
+    assert pending.body["data"]["paymentStatus"] == "payment_pending"
+    assert pending.body["data"]["cancellationStatus"] == "eligible"
+    assert pending.body["data"]["guestCount"] == {"total": 4, "source": "room_capacity"}
+    assert pending.body["data"]["priceBreakdown"]["total"] == {"amountCents": 52000, "currency": "USD", "formatted": "USD 520.00"}
+    assert "roomId" not in pending.body["data"]
+    assert "userId" not in pending.body["data"]
+    assert account.status_code == 200
+    assert {reservation["confirmationCode"] for reservation in account.body["data"]["reservations"]} >= {"res_garden_family_pending", "res_garden_family_cancelled"}
+    assert detail.status_code == 200
+    assert other_user.status_code == 403
+    assert other_user.body["error"] == {"code": "forbidden", "message": "You are not authorized to access this reservation."}
+    assert guest_confirmation.status_code == 200
+    assert guest_confirmation.body["data"]["guestContact"] == {"name": "Casey Visitor", "email": "visitor@example.test"}
+    assert guessed_guest.status_code == 404
+
+
+def test_admin_inventory_screen_and_mutation_adapters_validate_authorization_and_fields(tmp_path):
+    database = seeded_database(tmp_path)
+
+    screen = booking_api_get_admin_inventory_screen(str(database), user_id="usr_admin")
+    forbidden_screen = booking_api_get_admin_inventory_screen(str(database), user_id="usr_guest")
+    created_hotel = booking_api_admin_create_hotel(
+        str(database),
+        user_id="usr_admin",
+        payload={
+            "id": "htl_oakland_test",
+            "slug": "oakland-test-hotel",
+            "name": "Oakland Test Hotel",
+            "city": "Oakland",
+            "country": "US",
+            "address": "10 Broadway",
+            "starRating": 4,
+            "isSearchable": True,
+            "description": "Admin-created fixture hotel.",
+        },
+    )
+    created_room_type = booking_api_admin_create_room_type(
+        str(database),
+        user_id="usr_admin",
+        payload={
+            "id": "rt_oakland_king",
+            "hotelId": "htl_oakland_test",
+            "name": "Oakland King",
+            "capacity": 2,
+            "nightlyRateCents": 21000,
+            "currency": "USD",
+            "description": "King room.",
+        },
+    )
+    created_room = booking_api_admin_create_room(
+        str(database),
+        user_id="usr_admin",
+        payload={"id": "room_oakland_king_401", "roomTypeId": "rt_oakland_king", "roomNumber": "401", "floor": 4, "status": "active"},
+    )
+    invalid_room = booking_api_admin_create_room(
+        str(database),
+        user_id="usr_admin",
+        payload={"id": "room_oakland_bad", "roomTypeId": "rt_oakland_king", "roomNumber": "402", "floor": 4, "status": "dirty"},
+    )
+    non_admin_update = booking_api_admin_update_hotel(str(database), "htl_oakland_test", user_id="usr_guest", payload={"name": "Nope"})
+    updated_room_type = booking_api_admin_update_room_type(str(database), "rt_oakland_king", user_id="usr_admin", payload={"nightlyRateCents": 22000})
+    block = booking_api_admin_create_availability_block(
+        str(database),
+        user_id="usr_admin",
+        payload={
+            "id": "blk_oakland_king",
+            "hotelId": "htl_oakland_test",
+            "roomTypeId": "rt_oakland_king",
+            "blockType": "room_type_closure",
+            "startsOn": "2031-07-01",
+            "endsOn": "2031-07-03",
+            "reason": "Admin-created closure.",
+        },
+    )
+
+    assert screen.status_code == 200
+    assert {section["key"] for section in screen.body["data"]["sections"]} == {"hotels", "roomTypes", "rooms", "availabilityBlocks"}
+    assert forbidden_screen.status_code == 403
+    assert created_hotel.status_code == 201
+    assert created_hotel.body["data"]["slug"] == "oakland-test-hotel"
+    assert created_room_type.status_code == 201
+    assert created_room.status_code == 201
+    assert invalid_room.status_code == 400
+    assert invalid_room.body["error"]["fields"] == {"status": ["Must be active or maintenance."]}
+    assert non_admin_update.status_code == 403
+    assert updated_room_type.body["data"]["nightly_rate_cents"] == 22000
+    assert block.status_code == 201
+    with sqlite3.connect(database) as connection:
+        connection.row_factory = sqlite3.Row
+        assert available_room_ids(connection, "htl_oakland_test", "rt_oakland_king", "2031-07-01", "2031-07-02") == []
+        assert available_room_ids(connection, "htl_oakland_test", "rt_oakland_king", "2031-07-03", "2031-07-04") == ["room_oakland_king_401"]
 
 
 def test_admin_inventory_actions_create_blocking_audit_records(tmp_path):
@@ -425,6 +547,67 @@ def test_authorization_prevents_viewing_or_cancelling_another_users_booking(tmp_
     assert get_reservation_for_user(str(database), "res_bay_king_auth_confirmed", "usr_guest")["id"] == "res_bay_king_auth_confirmed"
     assert str(assert_raises(PermissionError, get_reservation_for_user, str(database), "res_bay_king_auth_confirmed", "usr_admin")) == "Reservation access denied."
     assert str(assert_raises(PermissionError, cancel_reservation, str(database), reservation_id="res_bay_king_auth_confirmed", user_id="usr_admin")) == "Reservation access denied."
+
+
+def test_booking_draft_renders_trusted_summary_and_price_for_available_room(tmp_path):
+    database = seeded_database(tmp_path)
+
+    draft = booking_api_get_booking_draft(
+        str(database),
+        {"hotelId": "htl_sfo_garden", "roomTypeId": "rt_garden_family", "checkIn": "2031-06-12", "checkOut": "2031-06-14", "adults": 2, "children": 1},
+    )
+
+    assert draft.status_code == 200
+    assert draft.body["data"]["staySummary"] == {"checkIn": "2031-06-12", "checkOut": "2031-06-14", "nights": 2, "adults": 2, "children": 1, "guests": 3}
+    assert draft.body["data"]["hotelSummary"]["name"] == "Mission Garden Inn"
+    assert draft.body["data"]["roomSummary"]["name"] == "Family Studio"
+    assert draft.body["data"]["priceSummary"]["total"] == {"amountCents": 52000, "currency": "USD", "formatted": "USD 520.00"}
+    assert draft.body["data"]["form"]["requiredFields"] == ["firstName", "lastName", "email", "adults", "children"]
+
+
+def test_booking_guest_details_success_conflict_validation_and_manipulation_guards(tmp_path):
+    database = seeded_database(tmp_path)
+    payload = {
+        "hotelId": "htl_sfo_garden",
+        "roomTypeId": "rt_garden_family",
+        "checkIn": "2031-06-10",
+        "checkOut": "2031-06-12",
+        "firstName": "Gale",
+        "lastName": "Guest",
+        "email": "guest@example.test",
+        "phone": "",
+        "adults": 2,
+        "children": 1,
+        "userId": "usr_guest",
+        "idempotencyKey": "booking-flow-success",
+    }
+
+    success = booking_api_submit_booking_details(str(database), payload)
+    duplicate = booking_api_submit_booking_details(str(database), payload)
+    conflict = booking_api_submit_booking_details(str(database), payload | {"idempotencyKey": "booking-flow-conflict"})
+    invalid = booking_api_submit_booking_details(str(database), payload | {"firstName": "", "email": "not-an-email", "idempotencyKey": "invalid-details"})
+    manipulated_room = booking_api_submit_booking_details(str(database), payload | {"roomTypeId": "rt_bay_king", "idempotencyKey": "manipulated-room"})
+    manipulated_hotel = booking_api_submit_booking_details(str(database), payload | {"hotelId": "htl_missing", "idempotencyKey": "manipulated-hotel"})
+
+    assert success.status_code == 201
+    assert success.body["data"]["status"] == "pending_payment"
+    assert success.body["data"]["guestName"] == "Gale Guest"
+    assert success.body["data"]["guestEmail"] == "guest@example.test"
+    assert success.body["data"]["total"] == {"amountCents": 52000, "currency": "USD", "formatted": "USD 520.00"}
+    assert duplicate.status_code == 200
+    assert duplicate.body["data"]["duplicateRequest"] is True
+    assert conflict.status_code == 409
+    assert conflict.body["error"] == {"code": "inventory_conflict", "message": "No rooms available for the requested stay."}
+    assert invalid.status_code == 400
+    assert invalid.body["error"]["fields"]["firstName"] == ["Field is required."]
+    assert invalid.body["error"]["fields"]["email"] == ["email must be a valid email address."]
+    assert manipulated_room.status_code == 400
+    assert manipulated_room.body["error"]["message"] == "Room type is not available for booking."
+    assert manipulated_hotel.status_code == 400
+    assert manipulated_hotel.body["error"]["message"] == "Hotel is not available for booking."
+    with sqlite3.connect(database) as connection:
+        created = connection.execute("SELECT COUNT(*) FROM reservations WHERE id LIKE 'res_draft_%'").fetchone()[0]
+    assert created == 1
 
 
 def test_api_response_contracts_for_success_validation_conflict_and_forbidden(tmp_path):

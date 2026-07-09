@@ -121,9 +121,12 @@ KEY_PAGE_KEYS = (
     "payment",
     "reservation_confirmation",
     "account_reservations",
+    "account_reservation_detail",
     "cancellation",
     "admin_hotels",
+    "admin_room_types",
     "admin_rooms",
+    "admin_availability_blocks",
     "admin_reservations",
 )
 
@@ -134,9 +137,12 @@ _REQUIRED_STATES_BY_PAGE: dict[str, tuple[str, ...]] = {
     "payment": ("loading", "validation_error", "payment_failure", "error", "success", "retry"),
     "reservation_confirmation": ("loading", "not_found", "forbidden", "error", "success", "retry"),
     "account_reservations": ("loading", "empty", "not_found", "forbidden", "error", "success", "retry"),
+    "account_reservation_detail": ("loading", "not_found", "forbidden", "error", "success", "retry"),
     "cancellation": ("loading", "validation_error", "conflict", "not_found", "forbidden", "error", "success", "retry"),
     "admin_hotels": ("loading", "empty", "validation_error", "forbidden", "error", "success", "retry"),
+    "admin_room_types": ("loading", "empty", "validation_error", "forbidden", "error", "success", "retry"),
     "admin_rooms": ("loading", "empty", "validation_error", "forbidden", "error", "success", "retry"),
+    "admin_availability_blocks": ("loading", "empty", "validation_error", "forbidden", "error", "success", "retry"),
     "admin_reservations": ("loading", "empty", "not_found", "forbidden", "error", "success", "retry"),
 }
 
@@ -156,9 +162,12 @@ _FORM_FIELDS: dict[str, tuple[FieldContract, ...]] = {
         FieldContract("roomTypeId", "Room type", required=True),
     ),
     "booking_guest_details": (
-        FieldContract("guestName", "Guest full name", required=True, autocomplete="name"),
-        FieldContract("guestEmail", "Guest email", "email", required=True, autocomplete="email"),
-        FieldContract("specialRequests", "Special requests", help_text="Optional accessibility or arrival notes."),
+        FieldContract("firstName", "First name", required=True, autocomplete="given-name"),
+        FieldContract("lastName", "Last name", required=True, autocomplete="family-name"),
+        FieldContract("email", "Email", "email", required=True, autocomplete="email"),
+        FieldContract("phone", "Phone", "tel", autocomplete="tel", help_text="Optional contact number."),
+        FieldContract("adults", "Adults", "number", required=True, help_text="At least one adult is required."),
+        FieldContract("children", "Children", "number", required=True, help_text="Enter 0 if no children are travelling."),
     ),
     "payment": (
         FieldContract("cardName", "Name on card", required=True, autocomplete="cc-name"),
@@ -183,6 +192,11 @@ _FORM_FIELDS: dict[str, tuple[FieldContract, ...]] = {
         FieldContract("capacity", "Capacity", "number", required=True),
         FieldContract("nightly_rate_cents", "Nightly rate in cents", "number", required=True),
         FieldContract("description", "Room type description", required=True),
+    ),
+    "admin_room": (
+        FieldContract("roomNumber", "Room number", required=True),
+        FieldContract("floor", "Floor", "number", required=True),
+        FieldContract("status", "Room status", required=True, help_text="Use active or maintenance."),
     ),
     "admin_availability_block": (
         FieldContract("blockType", "Block type", required=True),
@@ -238,7 +252,7 @@ def build_ui_contracts() -> dict[str, Any]:
     """Return the complete framework-neutral accessibility contract bundle."""
 
     forms = {key: build_form_contract(key) for key in _FORM_FIELDS}
-    pages = {key: {"states": build_page_states(key)} for key in KEY_PAGE_KEYS}
+    pages = {key: _page_contract(key) for key in KEY_PAGE_KEYS}
     return {
         "forms": forms,
         "pages": pages,
@@ -269,6 +283,59 @@ def build_ui_contracts() -> dict[str, Any]:
             "criticalPathsKeyboardReachable": ["search", "select-room", "guest-details", "payment", "confirmation"],
         },
     }
+
+
+def _page_contract(page_key: str) -> dict[str, Any]:
+    contract: dict[str, Any] = {"key": page_key, "states": build_page_states(page_key)}
+    reservation_fields = [
+        "confirmationCode",
+        "hotel",
+        "roomType",
+        "checkIn",
+        "checkOut",
+        "guestCount",
+        "guestContact",
+        "reservationStatus",
+        "paymentStatus",
+        "cancellationStatus",
+        "priceBreakdown",
+    ]
+    if page_key == "reservation_confirmation":
+        contract.update(
+            {
+                "dataFields": reservation_fields,
+                "statesByReservationStatus": {
+                    "pending_payment": "Payment pending",
+                    "confirmed": "Reservation confirmed",
+                    "cancelled": "Reservation cancelled",
+                },
+                "secureLookup": {"requiresConfirmationSecret": True, "doesNotUseGuessableIdentifiersOnly": True},
+            }
+        )
+    elif page_key == "account_reservations":
+        contract.update({"ownership": "authenticated-owner-only", "dataFields": reservation_fields})
+    elif page_key == "account_reservation_detail":
+        contract.update(
+            {
+                "ownership": "authenticated-owner-only",
+                "dataFields": reservation_fields,
+                "actions": [{"key": "cancel_reservation", "requiresEligibleStatus": ["confirmed", "pending_payment"]}],
+            }
+        )
+    elif page_key in {"admin_hotels", "admin_room_types", "admin_rooms", "admin_availability_blocks"}:
+        contract.update(
+            {
+                "authorization": "server-side-admin-required",
+                "fieldValidation": "server-side-field-level",
+                "mutations": {
+                    "admin_hotels": ["create_hotel", "edit_hotel"],
+                    "admin_room_types": ["create_room_type", "edit_room_type"],
+                    "admin_rooms": ["create_room", "edit_room"],
+                    "admin_availability_blocks": ["create_availability_block", "delete_availability_block"],
+                }[page_key],
+            }
+        )
+    return contract
 
 
 def render_form_html(form_key: str, field_errors: Mapping[str, list[str] | str] | None = None) -> str:
@@ -380,6 +447,7 @@ def _submit_label_for_form(form_key: str) -> str:
         "cancellation": "Cancel reservation",
         "admin_hotel": "Save hotel",
         "admin_room_type": "Save room type",
+        "admin_room": "Save room",
         "admin_availability_block": "Create availability block",
     }[form_key]
 

@@ -12,6 +12,7 @@ import secrets
 import sqlite3
 from dataclasses import dataclass
 from datetime import date
+from hashlib import sha256
 from math import ceil
 from typing import Any
 
@@ -148,8 +149,11 @@ def create_pending_reservation(
     children: int,
     created_at: str = "2031-04-01T10:00:00Z",
 ) -> dict[str, Any]:
-    """Create a pending reservation transactionally against current inventory."""
+    """Create a pending reservation transactionally against active inventory."""
 
+    _validate_required_text(reservation_id, "reservationId")
+    _validate_email(guest_email, "guestEmail")
+    _validate_required_text(guest_name, "guestName")
     with _connect(database_path) as connection:
         try:
             connection.execute("BEGIN IMMEDIATE")
@@ -158,12 +162,15 @@ def create_pending_reservation(
                 connection.rollback()
                 return _reservation_payload(duplicate, duplicate_request=True)
 
+            hotel = connection.execute("SELECT * FROM hotels WHERE id = ? AND is_searchable = 1", (hotel_id,)).fetchone()
+            if hotel is None:
+                raise BookingValidationError("Hotel is not available for booking.")
             room_type = connection.execute(
                 "SELECT * FROM room_types WHERE id = ? AND hotel_id = ?",
                 (room_type_id, hotel_id),
             ).fetchone()
             if room_type is None:
-                raise BookingValidationError("Unknown room type for hotel.")
+                raise BookingValidationError("Room type is not available for booking.")
             validate_occupancy(adults, children, room_type["capacity"])
             total_cents = calculate_total_cents(room_type["nightly_rate_cents"], check_in, check_out)
             room_ids = available_room_ids(connection, hotel_id, room_type_id, check_in, check_out)
@@ -831,6 +838,27 @@ def admin_delete_availability_block(
             raise
 
 
+def booking_api_get_booking_draft(database_path: str, query: dict[str, Any]) -> ApiResponse:
+    """Return trusted booking-page summary data for a selected active room type."""
+
+    try:
+        with _connect(database_path) as connection:
+            draft = _booking_draft_payload(
+                connection,
+                hotel_id=str(query.get("hotelId") or ""),
+                room_type_id=str(query.get("roomTypeId") or ""),
+                check_in=str(query.get("checkIn") or ""),
+                check_out=str(query.get("checkOut") or ""),
+                adults=_bounded_positive_int(query.get("adults", 1), "adults", minimum=1),
+                children=_bounded_positive_int(query.get("children", 0), "children", minimum=0),
+            )
+    except BookingConflict as exc:
+        return error_response(409, "inventory_conflict", str(exc))
+    except BookingValidationError as exc:
+        return error_response(400, "validation_error", str(exc))
+    return success_response(draft)
+
+
 def booking_api_create_reservation(database_path: str, payload: dict[str, Any]) -> ApiResponse:
     """HTTP-shaped create reservation adapter for response contract tests."""
 
@@ -849,8 +877,38 @@ def booking_api_create_reservation(database_path: str, payload: dict[str, Any]) 
             guest_name=payload["guestName"],
             check_in=payload["checkIn"],
             check_out=payload["checkOut"],
-            adults=int(payload["adults"]),
-            children=int(payload["children"]),
+            adults=_bounded_positive_int(payload["adults"], "adults", minimum=1),
+            children=_bounded_positive_int(payload["children"], "children", minimum=0),
+        )
+    except BookingConflict as exc:
+        return error_response(409, "inventory_conflict", str(exc))
+    except BookingValidationError as exc:
+        return error_response(400, "validation_error", str(exc))
+    status_code = 200 if reservation.get("duplicateRequest") else 201
+    return success_response(reservation, status_code=status_code)
+
+
+def booking_api_submit_booking_details(database_path: str, payload: dict[str, Any]) -> ApiResponse:
+    """Validate guest details and create a pending reservation after rechecking inventory."""
+
+    errors = _validate_booking_submission_fields(payload)
+    if errors:
+        return error_response(400, "validation_error", "Request body failed validation.", fields=errors)
+    first_name = str(payload["firstName"]).strip()
+    last_name = str(payload["lastName"]).strip()
+    try:
+        reservation = create_pending_reservation(
+            database_path,
+            reservation_id=_reservation_id_from_idempotency_key(str(payload["idempotencyKey"])),
+            hotel_id=str(payload["hotelId"]).strip(),
+            room_type_id=str(payload["roomTypeId"]).strip(),
+            user_id=payload.get("userId"),
+            guest_email=str(payload["email"]).strip(),
+            guest_name=f"{first_name} {last_name}",
+            check_in=str(payload["checkIn"]).strip(),
+            check_out=str(payload["checkOut"]).strip(),
+            adults=_bounded_positive_int(payload["adults"], "adults", minimum=1),
+            children=_bounded_positive_int(payload["children"], "children", minimum=0),
         )
     except BookingConflict as exc:
         return error_response(409, "inventory_conflict", str(exc))
@@ -997,6 +1055,246 @@ def booking_api_admin_update_reservation_status(database_path: str, reservation_
         return error_response(404, "not_found", str(exc))
     except BookingConflict as exc:
         return error_response(409, "reservation_conflict", str(exc))
+
+
+def booking_api_get_reservation_view(database_path: str, reservation_id: str, *, user_id: str | None = None, confirmation_secret: str | None = None) -> ApiResponse:
+    """Return a reservation screen view model for an owner or secret-bearing guest."""
+
+    with _connect(database_path) as connection:
+        row = _reservation_by_id(connection, reservation_id)
+        actor = _actor_by_id(connection, user_id)
+        if row is None:
+            return error_response(404, "not_found", "Reservation not found.")
+        if confirmation_secret is not None:
+            if row["checkout_type"] != "guest" or not secrets.compare_digest(row["confirmation_secret"], confirmation_secret):
+                return error_response(404, "not_found", "Reservation not found.")
+        elif not canViewReservation(actor, row) or actor is None or actor["role"] == "admin":
+            return error_response(403, "forbidden", "You are not authorized to access this reservation.")
+        return success_response(_reservation_view_payload(connection, row))
+
+
+def booking_api_get_account_reservations(database_path: str, *, user_id: str) -> ApiResponse:
+    """Return authenticated owner reservation summaries for the account page."""
+
+    with _connect(database_path) as connection:
+        actor = _actor_by_id(connection, user_id)
+        if actor is None or actor["role"] != "guest":
+            return error_response(403, "forbidden", "You are not authorized to access these reservations.")
+        rows = connection.execute("SELECT * FROM reservations WHERE user_id = ? ORDER BY created_at DESC, id", (user_id,)).fetchall()
+        return success_response({"reservations": [_reservation_view_payload(connection, row) for row in rows]})
+
+
+def booking_api_get_admin_inventory_screen(database_path: str, *, user_id: str) -> ApiResponse:
+    """Return admin inventory screen data after server-side authorization."""
+
+    with _connect(database_path) as connection:
+        actor = _actor_by_id(connection, user_id)
+        if not canAdministerHotel(actor, "*"):
+            return error_response(403, "forbidden", "Admin access required.")
+        return success_response(
+            {
+                "sections": [
+                    {"key": "hotels", "items": [dict(row) for row in connection.execute("SELECT * FROM hotels ORDER BY name").fetchall()]},
+                    {"key": "roomTypes", "items": [dict(row) for row in connection.execute("SELECT * FROM room_types ORDER BY hotel_id, name").fetchall()]},
+                    {"key": "rooms", "items": [dict(row) for row in connection.execute("SELECT * FROM rooms ORDER BY room_type_id, room_number").fetchall()]},
+                    {"key": "availabilityBlocks", "items": [dict(row) for row in connection.execute("SELECT * FROM availability_blocks ORDER BY starts_on, id").fetchall()]},
+                ]
+            }
+        )
+
+
+def booking_api_admin_create_hotel(database_path: str, *, user_id: str, payload: dict[str, Any]) -> ApiResponse:
+    required = ["id", "slug", "name", "city", "country", "address", "starRating", "isSearchable", "description"]
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
+    with _connect(database_path) as connection:
+        actor = _actor_by_id(connection, user_id)
+        if not canAdministerHotel(actor, "*"):
+            return error_response(403, "forbidden", "Admin access required.")
+        try:
+            connection.execute(
+                "INSERT INTO hotels VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (payload["id"], payload["slug"], payload["name"], payload["city"], payload["country"], payload["address"], int(payload["starRating"]), 1 if payload["isSearchable"] else 0, payload["description"]),
+            )
+            connection.commit()
+            return success_response(dict(connection.execute("SELECT * FROM hotels WHERE id = ?", (payload["id"],)).fetchone()), status_code=201)
+        except (sqlite3.IntegrityError, ValueError) as exc:
+            return error_response(400, "validation_error", str(exc))
+
+
+def booking_api_admin_create_room_type(database_path: str, *, user_id: str, payload: dict[str, Any]) -> ApiResponse:
+    required = ["id", "hotelId", "name", "capacity", "nightlyRateCents", "currency", "description"]
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
+    with _connect(database_path) as connection:
+        actor = _actor_by_id(connection, user_id)
+        if not canAdministerHotel(actor, payload["hotelId"]):
+            return error_response(403, "forbidden", "Admin access required.")
+        try:
+            connection.execute("INSERT INTO room_types VALUES (?, ?, ?, ?, ?, ?, ?)", (payload["id"], payload["hotelId"], payload["name"], int(payload["capacity"]), int(payload["nightlyRateCents"]), payload["currency"], payload["description"]))
+            connection.commit()
+            return success_response(dict(connection.execute("SELECT * FROM room_types WHERE id = ?", (payload["id"],)).fetchone()), status_code=201)
+        except (sqlite3.IntegrityError, ValueError) as exc:
+            return error_response(400, "validation_error", str(exc))
+
+
+def booking_api_admin_create_room(database_path: str, *, user_id: str, payload: dict[str, Any]) -> ApiResponse:
+    required = ["id", "roomTypeId", "roomNumber", "floor", "status"]
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
+    if payload["status"] not in {"active", "maintenance"}:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={"status": ["Must be active or maintenance."]})
+    with _connect(database_path) as connection:
+        room_type = connection.execute("SELECT * FROM room_types WHERE id = ?", (payload["roomTypeId"],)).fetchone()
+        if room_type is None:
+            return error_response(400, "validation_error", "Room type not found.")
+        actor = _actor_by_id(connection, user_id)
+        if not canAdministerHotel(actor, room_type["hotel_id"]):
+            return error_response(403, "forbidden", "Admin access required.")
+        try:
+            connection.execute("INSERT INTO rooms VALUES (?, ?, ?, ?, ?)", (payload["id"], payload["roomTypeId"], payload["roomNumber"], int(payload["floor"]), payload["status"]))
+            connection.commit()
+            return success_response(dict(connection.execute("SELECT * FROM rooms WHERE id = ?", (payload["id"],)).fetchone()), status_code=201)
+        except (sqlite3.IntegrityError, ValueError) as exc:
+            return error_response(400, "validation_error", str(exc))
+
+
+def booking_api_admin_create_availability_block(database_path: str, *, user_id: str, payload: dict[str, Any]) -> ApiResponse:
+    required = ["id", "hotelId", "blockType", "startsOn", "endsOn", "reason"]
+    missing = [field for field in required if field not in payload]
+    if missing:
+        return error_response(400, "validation_error", "Request body failed validation.", fields={field: ["Field is required."] for field in missing})
+    try:
+        block = admin_create_availability_block(database_path, block_id=payload["id"], hotel_id=payload["hotelId"], room_type_id=payload.get("roomTypeId"), room_id=payload.get("roomId"), user_id=user_id, block_type=payload["blockType"], starts_on=payload["startsOn"], ends_on=payload["endsOn"], reason=payload["reason"])
+        return success_response(block, status_code=201)
+    except PermissionError:
+        return error_response(403, "forbidden", "Admin access required.")
+    except (BookingValidationError, sqlite3.IntegrityError, ValueError) as exc:
+        return error_response(400, "validation_error", str(exc))
+
+
+def booking_api_admin_update_hotel(database_path: str, hotel_id: str, *, user_id: str, payload: dict[str, Any]) -> ApiResponse:
+    try:
+        changes = _camel_to_snake_changes(payload)
+        return success_response(admin_update_hotel(database_path, hotel_id=hotel_id, user_id=user_id, changes=changes))
+    except PermissionError:
+        return error_response(403, "forbidden", "Admin access required.")
+    except (LookupError, BookingValidationError) as exc:
+        return error_response(400, "validation_error", str(exc))
+
+
+def booking_api_admin_update_room_type(database_path: str, room_type_id: str, *, user_id: str, payload: dict[str, Any]) -> ApiResponse:
+    try:
+        changes = _camel_to_snake_changes(payload)
+        return success_response(admin_update_room_type(database_path, room_type_id=room_type_id, user_id=user_id, changes=changes))
+    except PermissionError:
+        return error_response(403, "forbidden", "Admin access required.")
+    except (LookupError, BookingValidationError) as exc:
+        return error_response(400, "validation_error", str(exc))
+
+
+def booking_api_admin_update_room(database_path: str, room_id: str, *, user_id: str, payload: dict[str, Any]) -> ApiResponse:
+    try:
+        changes = _camel_to_snake_changes(payload)
+        return success_response(admin_update_room(database_path, room_id=room_id, user_id=user_id, changes=changes))
+    except PermissionError:
+        return error_response(403, "forbidden", "Admin access required.")
+    except (LookupError, BookingValidationError) as exc:
+        return error_response(400, "validation_error", str(exc))
+
+
+def _booking_draft_payload(connection: sqlite3.Connection, *, hotel_id: str, room_type_id: str, check_in: str, check_out: str, adults: int, children: int) -> dict[str, Any]:
+    _validate_required_text(hotel_id, "hotelId")
+    _validate_required_text(room_type_id, "roomTypeId")
+    stay = parse_stay_dates(check_in, check_out)
+    hotel = connection.execute("SELECT * FROM hotels WHERE id = ? AND is_searchable = 1", (hotel_id,)).fetchone()
+    if hotel is None:
+        raise BookingValidationError("Hotel is not available for booking.")
+    room_type = connection.execute("SELECT * FROM room_types WHERE id = ? AND hotel_id = ?", (room_type_id, hotel_id)).fetchone()
+    if room_type is None:
+        raise BookingValidationError("Room type is not available for booking.")
+    total_guests = validate_occupancy(adults, children, room_type["capacity"])
+    available_rooms = available_room_ids(connection, hotel_id, room_type_id, check_in, check_out)
+    if not available_rooms:
+        raise BookingConflict("No rooms available for the requested stay.")
+    nightly = format_money(room_type["nightly_rate_cents"], room_type["currency"])
+    total = format_money(room_type["nightly_rate_cents"] * stay.nights, room_type["currency"])
+    return {
+        "staySummary": {"checkIn": check_in, "checkOut": check_out, "nights": stay.nights, "adults": adults, "children": children, "guests": total_guests},
+        "hotelSummary": {"id": hotel["id"], "slug": hotel["slug"], "name": hotel["name"], "city": hotel["city"], "country": hotel["country"]},
+        "roomSummary": {"id": room_type["id"], "name": room_type["name"], "capacity": room_type["capacity"], "description": room_type["description"], "availableRooms": len(available_rooms)},
+        "priceSummary": {"nightlyRate": nightly, "nights": stay.nights, "total": total},
+        "form": {"requiredFields": ["firstName", "lastName", "email", "adults", "children"], "optionalFields": ["phone"]},
+    }
+
+
+def _reservation_view_payload(connection: sqlite3.Connection, row: sqlite3.Row) -> dict[str, Any]:
+    hotel = connection.execute("SELECT * FROM hotels WHERE id = ?", (row["hotel_id"],)).fetchone()
+    room_type = connection.execute("SELECT * FROM room_types WHERE id = ?", (row["room_type_id"],)).fetchone()
+    latest_payment = connection.execute("SELECT * FROM payment_records WHERE reservation_id = ? ORDER BY created_at DESC LIMIT 1", (row["id"],)).fetchone()
+    payment_status = "payment_pending" if latest_payment is None or latest_payment["status"] == "authorized" else latest_payment["status"]
+    cancellation_status = "eligible" if row["status"] in CANCELLABLE_STATUSES else "not_eligible"
+    return {
+        "confirmationCode": row["id"],
+        "hotel": {"name": hotel["name"], "city": hotel["city"], "country": hotel["country"]} if hotel else None,
+        "roomType": {"name": room_type["name"], "capacity": room_type["capacity"]} if room_type else None,
+        "checkIn": row["check_in"],
+        "checkOut": row["check_out"],
+        "guestCount": {"total": room_type["capacity"] if room_type else 0, "source": "room_capacity"},
+        "guestContact": {"name": row["guest_name"], "email": row["guest_email"]},
+        "reservationStatus": row["status"],
+        "paymentStatus": payment_status,
+        "cancellationStatus": cancellation_status,
+        "priceBreakdown": {"total": format_money(row["total_cents"], row["currency"])},
+    }
+
+
+def _validate_booking_submission_fields(payload: dict[str, Any]) -> dict[str, list[str]]:
+    required = ["hotelId", "roomTypeId", "checkIn", "checkOut", "firstName", "lastName", "email", "adults", "children", "idempotencyKey"]
+    errors = {field: ["Field is required."] for field in required if field not in payload or str(payload.get(field) or "").strip() == ""}
+    for field in ("firstName", "lastName"):
+        if field not in errors and len(str(payload[field]).strip()) > 80:
+            errors[field] = ["Must be 80 characters or fewer."]
+    if "email" not in errors:
+        try:
+            _validate_email(str(payload["email"]), "email")
+        except BookingValidationError as exc:
+            errors["email"] = [str(exc)]
+    for field, minimum in (("adults", 1), ("children", 0)):
+        if field in errors:
+            continue
+        try:
+            _bounded_positive_int(payload[field], field, minimum=minimum)
+        except BookingValidationError as exc:
+            errors[field] = [str(exc)]
+    return errors
+
+
+def _validate_required_text(value: Any, field: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise BookingValidationError(f"{field} is required.")
+    return text
+
+
+def _validate_email(value: Any, field: str) -> str:
+    text = _validate_required_text(value, field)
+    if "@" not in text or text.startswith("@") or text.endswith("@"):
+        raise BookingValidationError(f"{field} must be a valid email address.")
+    return text
+
+
+def _reservation_id_from_idempotency_key(key: str) -> str:
+    clean = _validate_required_text(key, "idempotencyKey")
+    return "res_draft_" + sha256(clean.encode("utf-8")).hexdigest()[:24]
+
+
+def _camel_to_snake_changes(payload: dict[str, Any]) -> dict[str, Any]:
+    mapping = {"starRating": "star_rating", "isSearchable": "is_searchable", "nightlyRateCents": "nightly_rate_cents", "roomNumber": "room_number"}
+    return {mapping.get(key, key): value for key, value in payload.items()}
 
 
 def _cancel_reservation_in_transaction(

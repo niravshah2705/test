@@ -49,7 +49,7 @@ def test_seed_can_be_rerun_and_recreates_same_counts(tmp_path):
     assert second_counts["hotels"] == 3
     assert second_counts["room_types"] == 6
     assert second_counts["rooms"] == 12
-    assert second_counts["reservations"] == 7
+    assert second_counts["reservations"] == 9
     assert second_counts["availability_blocks"] == 3
 
 
