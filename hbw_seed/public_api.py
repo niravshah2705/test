@@ -8,6 +8,7 @@ availability backed by the deterministic SQLite schema.
 
 from __future__ import annotations
 
+import hashlib
 import re
 import sqlite3
 from dataclasses import dataclass
@@ -16,10 +17,23 @@ from math import ceil
 from typing import Any
 from urllib.parse import parse_qs
 
+from .abuse import (
+    DEFAULT_IDEMPOTENCY,
+    DEFAULT_RATE_LIMITER,
+    ENDPOINT_RATE_LIMIT_POLICIES,
+    IdempotencyService,
+    RateLimiter,
+    RequestContext,
+    body_within_limit,
+    build_rate_limit_key,
+    require_idempotency_key,
+)
+
 MAX_PAGE_SIZE = 50
 DEFAULT_PAGE = 1
 DEFAULT_PAGE_SIZE = 20
 MAX_GUESTS = 12
+MAX_MUTATION_BODY_BYTES = 8_192
 SLUG_PATTERN = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
@@ -55,18 +69,36 @@ def error_response(
     return ApiResponse(status_code, {"success": False, "data": None, "error": error})
 
 
-def handle_get(database_path: str, path: str, query_string: str = "") -> ApiResponse:
+def handle_get(
+    database_path: str,
+    path: str,
+    query_string: str = "",
+    *,
+    context: RequestContext | None = None,
+    rate_limiter: RateLimiter | None = None,
+) -> ApiResponse:
     """Dispatch a public GET request path to the matching API handler.
 
     Supported routes:
     - ``/api/search/hotels``
     - ``/api/hotels/:slug``
     - ``/api/hotels/:slug/availability``
+    - ``/api/reservations/confirmation/:code``
     """
 
     query = {key: values[-1] for key, values in parse_qs(query_string, keep_blank_values=True).items()}
     if path == "/api/search/hotels":
+        limited = _rate_limit("search", context=context, rate_limiter=rate_limiter)
+        if limited is not None:
+            return limited
         return search_hotels(database_path, query)
+
+    confirmation_match = re.fullmatch(r"/api/reservations/confirmation/([^/]+)", path)
+    if confirmation_match:
+        limited = _rate_limit("confirmation_lookup", context=context, rate_limiter=rate_limiter)
+        if limited is not None:
+            return limited
+        return get_reservation_confirmation(database_path, confirmation_match.group(1))
 
     detail_match = re.fullmatch(r"/api/hotels/([^/]+)", path)
     if detail_match:
@@ -75,6 +107,55 @@ def handle_get(database_path: str, path: str, query_string: str = "") -> ApiResp
     availability_match = re.fullmatch(r"/api/hotels/([^/]+)/availability", path)
     if availability_match:
         return get_hotel_availability(database_path, availability_match.group(1), query)
+
+    return error_response(404, "not_found", "Endpoint not found.")
+
+
+def handle_post(
+    database_path: str,
+    path: str,
+    body: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+    context: RequestContext | None = None,
+    rate_limiter: RateLimiter | None = None,
+    idempotency: IdempotencyService | None = None,
+) -> ApiResponse:
+    """Dispatch framework-neutral POST routes with abuse guards applied."""
+
+    headers = headers or {}
+    if not body_within_limit(body, MAX_MUTATION_BODY_BYTES):
+        return error_response(413, "request_too_large", "Request body exceeds the allowed size.")
+
+    if path == "/api/auth/sign-in":
+        limited = _rate_limit("sign_in", context=context, rate_limiter=rate_limiter)
+        if limited is not None:
+            return limited
+        return sign_in(database_path, body)
+
+    if path == "/api/reservations":
+        return _idempotent_mutation(
+            "reservation_create",
+            headers,
+            body,
+            lambda: create_reservation(database_path, body, context=context),
+            context=context,
+            rate_limiter=rate_limiter,
+            idempotency=idempotency,
+        )
+
+    if path == "/api/payments/intents":
+        reservation_id = str(body.get("reservationId") or "")
+        return _idempotent_mutation(
+            "payment_intent_create",
+            headers,
+            body,
+            lambda: create_payment_intent(database_path, body),
+            context=context,
+            rate_limiter=rate_limiter,
+            idempotency=idempotency,
+            discriminator=reservation_id,
+        )
 
     return error_response(404, "not_found", "Endpoint not found.")
 
@@ -176,6 +257,153 @@ def get_hotel_detail(database_path: str, slug: str) -> ApiResponse:
     return success_response(data)
 
 
+def get_reservation_confirmation(database_path: str, confirmation_code: str) -> ApiResponse:
+    if not re.fullmatch(r"[A-Za-z0-9_]{8,64}", confirmation_code):
+        return _validation_error({"confirmationCode": ["Confirmation code format is invalid."]})
+
+    with _connect(database_path) as connection:
+        reservation = connection.execute(
+            """
+            SELECT reservation.*, hotel.slug AS hotel_slug, hotel.name AS hotel_name
+            FROM reservations AS reservation
+            JOIN hotels AS hotel ON hotel.id = reservation.hotel_id
+            WHERE reservation.id = ?
+            """,
+            (confirmation_code,),
+        ).fetchone()
+        if reservation is None:
+            return error_response(404, "not_found", "Reservation not found.")
+
+    return success_response(
+        {
+            "confirmationCode": reservation["id"],
+            "hotelSlug": reservation["hotel_slug"],
+            "hotelName": reservation["hotel_name"],
+            "checkIn": reservation["check_in"],
+            "checkOut": reservation["check_out"],
+            "status": reservation["status"],
+            "total": {"amountCents": reservation["total_cents"], "currency": reservation["currency"]},
+        }
+    )
+
+
+def sign_in(database_path: str, body: dict[str, Any]) -> ApiResponse:
+    email = str(body.get("email") or "").strip().lower()
+    if not email:
+        return _validation_error({"email": ["Email is required."]})
+    with _connect(database_path) as connection:
+        user = connection.execute("SELECT id, email, full_name, role FROM users WHERE LOWER(email) = ?", (email,)).fetchone()
+    if user is None:
+        return error_response(401, "invalid_credentials", "Email or password is incorrect.")
+    return success_response({"user": {"id": user["id"], "email": user["email"], "fullName": user["full_name"], "role": user["role"]}})
+
+
+def create_reservation(database_path: str, body: dict[str, Any], *, context: RequestContext | None = None) -> ApiResponse:
+    required = ["hotelSlug", "roomTypeCode", "guestEmail", "guestName", "checkIn", "checkOut"]
+    errors = {field: ["Field is required."] for field in required if not str(body.get(field) or "").strip()}
+    validation = _validate_stay_and_occupancy(
+        {
+            "checkIn": str(body.get("checkIn") or ""),
+            "checkOut": str(body.get("checkOut") or ""),
+            "adults": str(body.get("adults", "1")),
+            "children": str(body.get("children", "0")),
+        },
+        require_destination=False,
+    )
+    errors.update(validation["errors"])
+    if errors:
+        return _validation_error(errors)
+
+    with _connect(database_path) as connection:
+        hotel = _active_hotel_by_slug(connection, str(body["hotelSlug"]))
+        if hotel is None:
+            return _not_found()
+        room_type = connection.execute(
+            "SELECT * FROM room_types WHERE id = ? AND hotel_id = ?", (str(body["roomTypeCode"]), hotel["id"])
+        ).fetchone()
+        if room_type is None:
+            return error_response(404, "not_found", "Room type not found.")
+        room = _first_available_room(connection, hotel["id"], room_type["id"], validation["check_in"], validation["check_out"])
+        if room is None:
+            return error_response(409, "inventory_unavailable", "Requested room type is no longer available.")
+
+        nights = (date.fromisoformat(validation["check_out"]) - date.fromisoformat(validation["check_in"])).days
+        total_cents = nights * int(room_type["nightly_rate_cents"])
+        reservation_fingerprint = hashlib.sha256(
+            "|".join(
+                str(body[field]) for field in ("hotelSlug", "roomTypeCode", "guestEmail", "checkIn", "checkOut")
+            ).encode("utf-8")
+        ).hexdigest()[:12]
+        reservation_id = f"res_idem_{reservation_fingerprint}"
+        user_id = context.user_id if context else None
+        checkout_type = "authenticated" if user_id else "guest"
+        connection.execute(
+            """
+            INSERT INTO reservations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending_payment', ?, ?, ?, ?, NULL, ?)
+            """,
+            (
+                reservation_id,
+                hotel["id"],
+                room_type["id"],
+                room["id"],
+                user_id,
+                str(body["guestEmail"]),
+                str(body["guestName"]),
+                validation["check_in"],
+                validation["check_out"],
+                checkout_type,
+                total_cents,
+                room_type["currency"],
+                "2031-03-10T10:00:00Z",
+                "2031-03-10T10:15:00Z",
+            ),
+        )
+        connection.commit()
+        room_type_currency = room_type["currency"]
+    return success_response(
+        {
+            "confirmationCode": reservation_id,
+            "status": "pending_payment",
+            "total": {"amountCents": total_cents, "currency": room_type_currency},
+        },
+        status_code=201,
+    )
+
+
+def create_payment_intent(database_path: str, body: dict[str, Any]) -> ApiResponse:
+    reservation_id = str(body.get("reservationId") or "").strip()
+    if not reservation_id:
+        return _validation_error({"reservationId": ["Reservation id is required."]})
+    with _connect(database_path) as connection:
+        reservation = connection.execute("SELECT * FROM reservations WHERE id = ?", (reservation_id,)).fetchone()
+        if reservation is None:
+            return error_response(404, "not_found", "Reservation not found.")
+        payment_id = f"pay_intent_{reservation_id}"
+        existing = connection.execute("SELECT * FROM payment_records WHERE id = ?", (payment_id,)).fetchone()
+        if existing is None:
+            connection.execute(
+                "INSERT INTO payment_records VALUES (?, ?, 'fixture_gateway', ?, ?, ?, 'authorized', ?)",
+                (
+                    payment_id,
+                    reservation_id,
+                    f"fx_intent_{reservation_id}",
+                    reservation["total_cents"],
+                    reservation["currency"],
+                    "2031-03-10T10:01:00Z",
+                ),
+            )
+            connection.commit()
+    return success_response(
+        {
+            "paymentIntentId": payment_id,
+            "reservationId": reservation_id,
+            "amount": {"amountCents": reservation["total_cents"], "currency": reservation["currency"]},
+            "status": "authorized",
+        },
+        status_code=201,
+    )
+
+
 def get_hotel_availability(database_path: str, slug: str, query: dict[str, str]) -> ApiResponse:
     errors: dict[str, list[str]] = {}
     slug_errors = _validate_slug(slug)
@@ -207,6 +435,61 @@ def get_hotel_availability(database_path: str, slug: str, query: dict[str, str])
         "roomTypes": room_types,
     }
     return success_response(data)
+
+
+def _rate_limit(
+    endpoint: str,
+    *,
+    context: RequestContext | None,
+    rate_limiter: RateLimiter | None,
+    discriminator: str | None = None,
+) -> ApiResponse | None:
+    policy = ENDPOINT_RATE_LIMIT_POLICIES[endpoint]
+    limiter = rate_limiter or DEFAULT_RATE_LIMITER
+    request_context = context or RequestContext()
+    key = build_rate_limit_key(policy, request_context, discriminator)
+    try:
+        result = limiter.check(key, policy)
+    except Exception:
+        if policy.fail_open:
+            return None
+        return error_response(503, "rate_limiter_unavailable", "Rate limiter is unavailable.")
+    if result.allowed:
+        return None
+    return error_response(
+        429,
+        "rate_limit_exceeded",
+        "Too many requests. Please retry later.",
+        fields={"retryAfterSeconds": [str(result.retry_after_seconds)], "policy": [policy.name]},
+    )
+
+
+def _idempotent_mutation(
+    endpoint: str,
+    headers: dict[str, str],
+    body: dict[str, Any],
+    operation,
+    *,
+    context: RequestContext | None,
+    rate_limiter: RateLimiter | None,
+    idempotency: IdempotencyService | None,
+    discriminator: str | None = None,
+) -> ApiResponse:
+    idempotency_key = require_idempotency_key(headers)
+    if idempotency_key is None:
+        return error_response(
+            400,
+            "idempotency_key_required",
+            "A valid Idempotency-Key header is required for this mutation.",
+        )
+    limited = _rate_limit(endpoint, context=context, rate_limiter=rate_limiter, discriminator=discriminator)
+    if limited is not None:
+        return limited
+    service = idempotency or DEFAULT_IDEMPOTENCY
+    response, replayed = service.run(endpoint, idempotency_key, body, operation)
+    if replayed:
+        response.body.setdefault("meta", {})["idempotentReplay"] = True
+    return response
 
 
 def _connect(database_path: str) -> sqlite3.Connection:
@@ -303,6 +586,44 @@ def _active_hotel_by_slug(connection: sqlite3.Connection, slug: str) -> sqlite3.
     return connection.execute(
         "SELECT * FROM hotels WHERE slug = ? AND is_searchable = 1",
         (slug,),
+    ).fetchone()
+
+
+def _first_available_room(
+    connection: sqlite3.Connection,
+    hotel_id: str,
+    room_type_id: str,
+    check_in: str,
+    check_out: str,
+) -> sqlite3.Row | None:
+    return connection.execute(
+        """
+        SELECT room.*
+        FROM rooms AS room
+        WHERE room.room_type_id = ?
+          AND room.status = 'active'
+          AND NOT EXISTS (
+            SELECT 1 FROM availability_blocks AS block
+            WHERE block.hotel_id = ?
+              AND block.starts_on < ?
+              AND block.ends_on > ?
+              AND (
+                block.block_type = 'hotel_closure'
+                OR block.room_type_id = ?
+                OR block.room_id = room.id
+              )
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM reservations AS reservation
+            WHERE reservation.room_id = room.id
+              AND reservation.check_in < ?
+              AND reservation.check_out > ?
+              AND reservation.status IN ('confirmed', 'pending_payment')
+          )
+        ORDER BY room.room_number
+        LIMIT 1
+        """,
+        (room_type_id, hotel_id, check_out, check_in, room_type_id, check_out, check_in),
     ).fetchone()
 
 

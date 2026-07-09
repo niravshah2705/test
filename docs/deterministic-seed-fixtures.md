@@ -56,6 +56,26 @@ A single-night maintenance scenario also covers `2031-06-10` to `2031-06-11`.
 | Published/unpublished review moderation | `rev_bay_pub`, `rev_bay_unpub` | Public review queries should include published rows and exclude unpublished rows. |
 | Admin audit trail | `aud_seed_run`, `aud_hotel_closure`, `aud_room_type_closure`, `aud_refund` | Admin/back-office flows can verify deterministic audit records for seed, block, and refund actions. |
 
+## Application abuse-protection policies
+
+NIR-520 adds framework-neutral abuse guards around the deterministic public API
+contracts. The default limiter and idempotency stores are in-memory and intended
+for local/test execution; production adapters can replace them behind the same
+interfaces.
+
+| Endpoint | Keying | Limit | Limiter failure | Idempotency |
+| --- | --- | --- | --- | --- |
+| `POST /api/auth/sign-in` | Anonymous IP | 5/minute | Fail closed | Not required |
+| `GET /api/search/hotels` | Authenticated user, otherwise IP | 30/minute | Fail open | Not required |
+| `GET /api/reservations/confirmation/:code` | Anonymous IP | 8/minute | Fail closed | Not required |
+| `POST /api/reservations` | Authenticated user, otherwise IP | 10/minute | Fail closed | Required |
+| `POST /api/payments/intents` | User/IP plus reservation id | 12/minute | Fail closed | Required |
+
+Sensitive mutations also enforce an 8 KiB expected body-size guard and return the
+shared error envelope for missing idempotency keys, limiter failures, and
+exceeded limits. Replaying the same idempotency key with the same body returns
+the previously stored safe response and annotates `meta.idempotentReplay`.
+
 ## Availability query expectation
 
 A room is available when it is active, overlaps no hotel/room-type/room-level
