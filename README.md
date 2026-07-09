@@ -15,6 +15,9 @@ booking, payment, cancellation, refund, review moderation, and admin audit flows
 
 Fixture documentation and expected outcomes are in
 [`docs/deterministic-seed-fixtures.md`](docs/deterministic-seed-fixtures.md).
+Accessibility and resilient UI state contracts for server-rendered search,
+booking, payment, account, cancellation, and admin flows live in
+`hbw_seed.ui_contracts` and are covered by automated tests.
 
 ## Validate
 
