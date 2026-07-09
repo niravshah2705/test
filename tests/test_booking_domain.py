@@ -79,6 +79,15 @@ def test_audit_service_records_actor_event_entity_metadata_timestamp_and_sanitiz
 
     assert metadata == {"amountCents": 1000, "nested": {"kept": True}, "items": [{"safe": "value"}]}
 
+    case_variant_metadata = sanitize_metadata(
+        {
+            "PasswordHash": "hash_secret",
+            "paymentToken": "tok_secret",
+            "nested": {"RawProviderPayload": {"secret": True}, "kept": "ok"},
+        }
+    )
+    assert case_variant_metadata == {"nested": {"kept": "ok"}}
+
 
 def test_reservation_payment_refund_cancellation_audits_and_duplicate_webhook_idempotency(tmp_path):
     database = seeded_database(tmp_path)

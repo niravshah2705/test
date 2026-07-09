@@ -623,9 +623,7 @@ def _parse_snapshot(raw: Any) -> Any:
 
 def _validate_payment_payload(draft: dict[str, Any], payload: Mapping[str, Any]) -> dict[str, Any]:
     errors: dict[str, list[str]] = {}
-    for field in SENSITIVE_PAYMENT_FIELDS:
-        if field in payload:
-            errors[field] = ["Raw card data must be entered only in provider-hosted tokenized fields."]
+    _reject_sensitive_payment_fields(payload, "", errors)
     if str(payload.get("bookingId") or payload.get("draftId") or "") != draft["id"]:
         errors["bookingId"] = ["bookingId must match the booking being paid."]
     token = str(payload.get("paymentToken") or payload.get("paymentReference") or "").strip()
@@ -641,6 +639,23 @@ def _validate_payment_payload(draft: dict[str, Any], payload: Mapping[str, Any])
     if not str(payload.get("currency") or "").strip():
         errors["currency"] = ["Payment currency is required."]
     return {"errors": errors, "paymentToken": token, "idempotencyKey": idempotency_key}
+
+
+def _reject_sensitive_payment_fields(value: Any, path: str, errors: dict[str, list[str]]) -> None:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            field_path = f"{path}.{key}" if path else str(key)
+            if _payment_field_is_sensitive(str(key)):
+                errors[field_path] = ["Raw card data must be entered only in provider-hosted tokenized fields."]
+            _reject_sensitive_payment_fields(child, field_path, errors)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            _reject_sensitive_payment_fields(child, f"{path}[{index}]" if path else f"[{index}]", errors)
+
+
+def _payment_field_is_sensitive(field: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", field.lower())
+    return field in SENSITIVE_PAYMENT_FIELDS or normalized in {"cardnumber", "number", "cvv", "cvc", "pan", "expiry", "expiration", "card"}
 
 
 def _payment_attempt(draft: dict[str, Any], idempotency_key: str, payment_token: str, status: str, failure_reason: str | None) -> dict[str, Any]:
@@ -836,7 +851,10 @@ def _validate_document(raw: Mapping[str, Any], prefix: str, required: bool, trav
     issuing_country = str(raw.get("issuingCountry") or raw.get("issuing_country") or "").strip().upper()
     nationality_country = str(raw.get("nationalityCountry") or raw.get("nationality_country") or issuing_country).strip().upper()
     expires_on = str(raw.get("expiresOn") or raw.get("expires_on") or "").strip()
+    full_document_number = _optional_text(raw.get("documentNumber") or raw.get("document_number") or raw.get("fullDocumentNumber") or raw.get("full_document_number"))
     last4 = _optional_text(raw.get("documentNumberLast4") or raw.get("document_number_last4"))
+    if full_document_number is not None:
+        errors[f"{prefix}.document.documentNumber"] = ["Full document numbers must be tokenized before submission; send documentNumberLast4 only."]
     if document_type not in DOCUMENT_TYPES:
         errors[f"{prefix}.document.documentType"] = ["Document type must be passport or national_id."]
     if not COUNTRY_RE.fullmatch(issuing_country):

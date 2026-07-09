@@ -69,6 +69,16 @@ def test_payment_rejects_raw_card_data_and_before_successful_revalidation():
     assert raw_card.fields["cardNumber"] == ["Raw card data must be entered only in provider-hosted tokenized fields."]
     assert raw_card.fields["cvv"] == ["Raw card data must be entered only in provider-hosted tokenized fields."]
 
+    nested_raw_card = assert_raises(
+        CheckoutValidationError,
+        finalize_booking_payment,
+        draft["id"],
+        payment_payload(repository.get(draft["id"]), idempotencyKey="idem-fixture-0003", billing={"card": {"number": "4242424242424242", "cvc": "123"}}),
+        repository=repository,
+    )
+    assert nested_raw_card.fields["billing.card.number"] == ["Raw card data must be entered only in provider-hosted tokenized fields."]
+    assert nested_raw_card.fields["billing.card.cvc"] == ["Raw card data must be entered only in provider-hosted tokenized fields."]
+
 
 def test_amount_currency_mismatch_and_stale_price_are_rejected():
     repository, draft, _ = validated_draft("price_change")

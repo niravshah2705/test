@@ -77,3 +77,15 @@ Prefer aliases over long relative paths across architectural boundaries.
 5. Put reusable client-safe components in `src/ui/`.
 6. Use shared helpers from `src/lib/` instead of duplicating cross-cutting concerns.
 7. Confirm client components do not import `@/lib/db`, repositories, or ORM clients.
+
+## Privacy and security conventions
+
+User-owned resources must be scoped by the authenticated owner at the repository or service boundary before any DTO is built. Passenger profiles, contact details, documents, reservations, booking drafts, payment actions, and account/session reads should reject cross-user identifiers with a forbidden/not-found response that does not reveal another user's data.
+
+Use DTO mappers for every response. Public and traveler-facing payloads must exclude password hashes, raw payment tokens, provider-native references/payloads, physical room IDs, confirmation secrets, and full identity document numbers. Document storage and validation accepts only tokenized/provider-safe values plus `documentNumberLast4`; raw full document numbers and raw card fields must be rejected without echoing their values.
+
+Audit and log metadata must pass through the shared sanitizer before persistence or emission. Add new sensitive key aliases to the sanitizer when introducing providers or payment/document fields, and prefer allowlisted status/reason fields over raw request, provider error, or provider payload blobs.
+
+Sensitive actions such as sign-in, payment finalization, payment webhooks, booking confirmation polling, saved passenger profile access, cancellation, refunds, and admin reservation search must call an application-level abuse guard/rate guard interface before the irreversible action. The guard should be injected at the service/handler boundary so this repository can test enforcement without provisioning infrastructure.
+
+Password handling must keep hashes server-side only: registration and login responses use safe identity DTOs, tests assert stored passwords are hashed, and current-user/session helpers must never serialize `password_hash`. Payment handling must require tokenized provider references, idempotency keys, ownership checks against the booking/draft, and amount/currency matching before capture or confirmation.

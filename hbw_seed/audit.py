@@ -28,8 +28,14 @@ SENSITIVE_METADATA_KEYS = {
     "identity_document",
     "pan",
     "password",
+    "passwordHash",
+    "password_hash",
+    "paymentToken",
+    "payment_token",
     "providerError",
     "provider_error",
+    "providerPayload",
+    "provider_payload",
     "providerReference",
     "provider_reference",
     "providerSecret",
@@ -38,12 +44,15 @@ SENSITIVE_METADATA_KEYS = {
     "raw_payload",
     "rawProviderError",
     "raw_provider_error",
+    "rawProviderPayload",
+    "raw_provider_payload",
     "requestPayload",
     "request_payload",
     "secret",
     "ssn",
     "token",
 }
+SENSITIVE_METADATA_KEY_FINGERPRINTS = {"".join(character for character in key.lower() if character.isalnum()) for key in SENSITIVE_METADATA_KEYS}
 
 MAX_METADATA_JSON_BYTES = 4096
 
@@ -257,10 +266,15 @@ def sanitize_metadata(metadata: Mapping[str, Any]) -> dict[str, Any]:
 
     safe: dict[str, Any] = {}
     for key, value in metadata.items():
-        if str(key) in SENSITIVE_METADATA_KEYS:
+        if _is_sensitive_metadata_key(str(key)):
             continue
         safe[key] = _sanitize_value(value)
     return safe
+
+
+def _is_sensitive_metadata_key(key: str) -> bool:
+    fingerprint = "".join(character for character in key.lower() if character.isalnum())
+    return fingerprint in SENSITIVE_METADATA_KEY_FINGERPRINTS
 
 
 def _sanitize_value(value: Any) -> Any:
