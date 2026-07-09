@@ -15,7 +15,11 @@ from hbw_seed.booking import (
     available_room_ids,
     booking_api_cancel_reservation,
     booking_api_create_reservation,
+    booking_api_admin_cancel_reservation,
     booking_api_admin_get_reservation,
+    booking_api_admin_refund_reservation,
+    booking_api_admin_search_reservations,
+    booking_api_admin_update_reservation_status,
     booking_api_get_guest_reservation,
     booking_api_get_reservation,
     booking_api_record_payment,
@@ -622,3 +626,100 @@ def test_admin_endpoint_rejects_non_admin_and_returns_operational_dto_only_to_ad
     assert accepted.status_code == 200
     assert accepted.body["data"]["roomId"] == "room_bay_king_502"
     assert accepted.body["data"]["userId"] == "usr_guest"
+
+
+def test_guest_cancellation_is_idempotent_and_forbidden_access_leaks_no_data(tmp_path):
+    database = seeded_database(tmp_path)
+    reservation = create_pending_reservation(
+        str(database),
+        reservation_id="res_guest_cancel_api",
+        hotel_id="htl_sfo_garden",
+        room_type_id="rt_garden_family",
+        user_id="usr_guest",
+        guest_email="guest@example.test",
+        guest_name="Gale Guest",
+        check_in="2031-06-12",
+        check_out="2031-06-14",
+        adults=2,
+        children=1,
+    )
+    record_payment_webhook(
+        str(database),
+        provider_reference="fx_guest_cancel_api",
+        reservation_id=reservation["id"],
+        amount_cents=reservation["total"]["amountCents"],
+    )
+
+    forbidden = booking_api_cancel_reservation(str(database), reservation["id"], "usr_admin")
+    first = booking_api_cancel_reservation(str(database), reservation["id"], "usr_guest")
+    duplicate = booking_api_cancel_reservation(str(database), reservation["id"], "usr_guest")
+
+    assert forbidden.status_code == 403
+    assert forbidden.body == {"success": False, "data": None, "error": {"code": "forbidden", "message": "You are not authorized to cancel this reservation."}}
+    assert first.status_code == 200
+    assert first.body["data"]["refund"]["amount"]["amountCents"] == 52000
+    assert duplicate.status_code == 200
+    assert duplicate.body["data"]["duplicateRequest"] is True
+    with sqlite3.connect(database) as connection:
+        refunds = connection.execute("SELECT COUNT(*) FROM refunds WHERE payment_record_id = 'pay_fx_guest_cancel_api'").fetchone()[0]
+    assert refunds == 1
+
+
+def test_admin_cancellation_search_filters_and_pagination_bounds(tmp_path):
+    database = seeded_database(tmp_path)
+
+    rejected = booking_api_admin_search_reservations(str(database), {"hotelId": "htl_sfo_bay"}, "usr_guest")
+    too_large = booking_api_admin_search_reservations(str(database), {"pageSize": 51}, "usr_admin")
+    filtered = booking_api_admin_search_reservations(
+        str(database),
+        {"hotelId": "htl_sfo_bay", "status": "confirmed", "guestEmail": "guest@example", "checkInFrom": "2031-06-10", "checkInTo": "2031-06-12", "page": 1, "pageSize": 2},
+        "usr_admin",
+    )
+    cancelled = booking_api_admin_cancel_reservation(str(database), "res_bay_suite_confirmed", "usr_admin")
+    duplicate = booking_api_admin_cancel_reservation(str(database), "res_bay_suite_confirmed", "usr_admin")
+
+    assert rejected.status_code == 403
+    assert rejected.body == {"success": False, "data": None, "error": {"code": "forbidden", "message": "Admin access required."}}
+    assert too_large.status_code == 400
+    assert "less than or equal to 50" in too_large.body["error"]["message"]
+    assert filtered.status_code == 200
+    assert filtered.body["data"]["pagination"] == {"page": 1, "pageSize": 2, "total": 2, "totalPages": 1}
+    assert {row["id"] for row in filtered.body["data"]["reservations"]} == {"res_bay_king_auth_confirmed", "res_bay_suite_confirmed"}
+    assert cancelled.status_code == 200
+    assert cancelled.body["data"]["status"] == "cancelled"
+    assert cancelled.body["data"]["refund"]["amount"]["amountCents"] == 84000
+    assert duplicate.status_code == 200
+    assert duplicate.body["data"]["duplicateRequest"] is True
+
+
+def test_admin_refund_full_invalid_amount_and_duplicate_request(tmp_path):
+    database = seeded_database(tmp_path)
+
+    invalid = booking_api_admin_refund_reservation(str(database), "res_bay_king_auth_confirmed", "usr_admin", {"amountCents": 48001, "refundId": "ref_invalid_over"})
+    full = booking_api_admin_refund_reservation(str(database), "res_bay_king_auth_confirmed", "usr_admin", {"amountCents": 48000, "refundId": "ref_admin_full"})
+    duplicate = booking_api_admin_refund_reservation(str(database), "res_bay_king_auth_confirmed", "usr_admin", {"amountCents": 48000, "refundId": "ref_admin_full"})
+
+    assert invalid.status_code == 400
+    assert invalid.body["error"] == {"code": "validation_error", "message": "Refund amount exceeds captured refundable amount."}
+    assert full.status_code == 201
+    assert full.body["data"]["refund"] == {"id": "ref_admin_full", "amount": {"amountCents": 48000, "currency": "USD", "formatted": "USD 480.00"}, "status": "succeeded"}
+    assert duplicate.status_code == 200
+    assert duplicate.body["data"]["duplicateRequest"] is True
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT status FROM payment_records WHERE id = 'pay_bay_king_auth'").fetchone()[0] == "refunded"
+        assert connection.execute("SELECT COUNT(*) FROM refunds WHERE id = 'ref_admin_full'").fetchone()[0] == 1
+
+
+def test_admin_status_endpoint_rejects_invalid_transitions(tmp_path):
+    database = seeded_database(tmp_path)
+
+    forbidden = booking_api_admin_update_reservation_status(str(database), "res_garden_family_pending", "usr_guest", {"status": "expired"})
+    invalid = booking_api_admin_update_reservation_status(str(database), "res_bay_king_auth_confirmed", "usr_admin", {"status": "confirmed"})
+    valid = booking_api_admin_update_reservation_status(str(database), "res_garden_family_pending", "usr_admin", {"status": "expired"})
+
+    assert forbidden.status_code == 403
+    assert forbidden.body["data"] is None
+    assert invalid.status_code == 409
+    assert invalid.body["error"] == {"code": "reservation_conflict", "message": "Invalid reservation status transition."}
+    assert valid.status_code == 200
+    assert valid.body["data"]["status"] == "expired"
